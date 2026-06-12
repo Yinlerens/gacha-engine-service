@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gacha-engine-service
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: gacha-engine-service
+    app.kubernetes.io/part-of: gacha-engine-service
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Yinlerens/gacha-engine-service.git
+    targetRevision: main
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gacha-engine-service
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+

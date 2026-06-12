@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gacha-engine-service"
+dynamic = ["version"]
+description = "A stateless FastAPI gacha engine that stores pity snapshots in Redis and publishes pull events to Kafka."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiokafka>=0.12.0,<1.0.0",
+    "asyncpg>=0.30.0,<1.0.0",
+    "fastapi>=0.115.0,<1.0.0",
+    "redis>=5.2.0,<7.0.0",
+    "uvicorn[standard]>=0.32.0,<1.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "httpx>=0.28.0,<1.0.0",
+    "pytest>=8.3.0,<9.0.0",
+]
+
+[project.scripts]
+gacha-engine-service = "gacha_engine_service.server:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "gacha_engine_service.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["gacha_engine_service*"]

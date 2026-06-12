@@ -1,0 +1,158 @@
+"""Static gacha catalog for the first engine version."""
+
+from __future__ import annotations
+
+from .schemas import Banner, BannerTheme, GachaItem
+
+
+GACHA_ITEMS: list[GachaItem] = [
+    GachaItem(
+        id="char-luoxian",
+        name="洛弦",
+        subtitle="归潮的观测者",
+        rarity=5,
+        type="character",
+        element="导电",
+        role="主 C",
+        faction="白塔档案局",
+        accent="#f6c453",
+        quote="让风暴归档，让星海回答。",
+    ),
+    GachaItem(
+        id="char-xingjian",
+        name="星见遥",
+        subtitle="夜航列车长",
+        rarity=5,
+        type="character",
+        element="冷凝",
+        role="速切",
+        faction="环城铁道",
+        accent="#79d7ff",
+        quote="下一站，越过今晚。",
+    ),
+    GachaItem(
+        id="weapon-aurora",
+        name="极昼回声",
+        subtitle="五星音感仪",
+        rarity=5,
+        type="weapon",
+        element="共鸣",
+        role="增幅",
+        faction="古物",
+        accent="#f8e38f",
+        quote="黎明被封存在晶体里。",
+    ),
+    GachaItem(
+        id="char-qinglan",
+        name="青岚",
+        subtitle="云端巡礼人",
+        rarity=4,
+        type="character",
+        element="气动",
+        role="辅助",
+        faction="九枝会",
+        accent="#64dca8",
+        quote="顺风时，答案会自己走近。",
+    ),
+    GachaItem(
+        id="char-miyue",
+        name="弥月",
+        subtitle="月相修复师",
+        rarity=4,
+        type="character",
+        element="衍射",
+        role="治疗",
+        faction="月台医院",
+        accent="#d8b4fe",
+        quote="别怕，我会把裂缝补好。",
+    ),
+    GachaItem(
+        id="weapon-bell",
+        name="白昼铃",
+        subtitle="四星音感仪",
+        rarity=4,
+        type="weapon",
+        element="共鸣",
+        role="充能",
+        faction="工坊",
+        accent="#f6d58f",
+        quote="铃声轻响，伤口便睡去。",
+    ),
+    GachaItem(
+        id="weapon-cinder",
+        name="余温",
+        subtitle="三星迅刃",
+        rarity=3,
+        type="weapon",
+        element="斩击",
+        role="训练",
+        faction="制式",
+        accent="#9aa3b2",
+        quote="仍有一点热度。",
+    ),
+    GachaItem(
+        id="weapon-tide",
+        name="潮汐笔记",
+        subtitle="三星音感仪",
+        rarity=3,
+        type="weapon",
+        element="共鸣",
+        role="训练",
+        faction="制式",
+        accent="#7fb5cf",
+        quote="初学者的第一页。",
+    ),
+]
+
+BANNERS: list[Banner] = [
+    Banner(
+        id="limited-character-001",
+        name="归潮观测",
+        short_name="限定角色",
+        type="limited-character",
+        description="洛弦概率提升。五星角色 50% 命中 UP，未命中后下次五星必定为 UP。",
+        featured_five_id="char-luoxian",
+        featured_four_ids=["char-qinglan", "char-miyue", "weapon-bell"],
+        item_pool=[
+            "char-luoxian",
+            "char-xingjian",
+            "weapon-aurora",
+            "char-qinglan",
+            "char-miyue",
+            "weapon-bell",
+            "weapon-cinder",
+            "weapon-tide",
+        ],
+        theme=BannerTheme(
+            primary="#f6c453",
+            secondary="#18c7a3",
+            glow="rgba(246, 196, 83, 0.28)",
+        ),
+    ),
+    Banner(
+        id="standard-001",
+        name="群星回声",
+        short_name="常驻唤取",
+        type="standard",
+        description="常驻角色与武器混合池。五星无 UP 机制，适合测试完整概率。",
+        featured_four_ids=["char-qinglan", "char-miyue", "weapon-bell"],
+        item_pool=[
+            "char-xingjian",
+            "weapon-aurora",
+            "char-qinglan",
+            "char-miyue",
+            "weapon-bell",
+            "weapon-cinder",
+            "weapon-tide",
+        ],
+        theme=BannerTheme(
+            primary="#79d7ff",
+            secondary="#ff8f70",
+            glow="rgba(121, 215, 255, 0.22)",
+        ),
+    ),
+]
+
+ITEM_BY_ID: dict[str, GachaItem] = {item.id: item for item in GACHA_ITEMS}
+BANNER_BY_ID: dict[str, Banner] = {banner.id: banner for banner in BANNERS}
+
