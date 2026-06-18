@@ -60,6 +60,11 @@ spec:
               value: gacha-engine-service
             - name: REDIS_KEY_PREFIX
               value: gacha:pity
+            - name: GACHA_CONFIG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gacha-engine-service-secrets
+                  key: gacha-config-database-url
           startupProbe:
             httpGet:
               port: http
