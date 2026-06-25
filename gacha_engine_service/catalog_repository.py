@@ -96,6 +96,13 @@ class PostgresCatalogRepository:
                     version_ids,
                     timeout=self._query_timeout_seconds,
                 )
+                rule_set_ids = sorted(
+                    {
+                        str(row["rule_set_id"])
+                        for row in banner_rows
+                        if row["rule_set_id"] is not None
+                    }
+                )
                 rarity_rows = await connection.fetch(
                     RARITY_RATES_SQL,
                     version_ids,
@@ -104,6 +111,21 @@ class PostgresCatalogRepository:
                 featured_rows = await connection.fetch(
                     FEATURED_RULES_SQL,
                     version_ids,
+                    timeout=self._query_timeout_seconds,
+                )
+                rule_set_rarity_rows = await connection.fetch(
+                    RULE_SET_RARITY_RATES_SQL,
+                    rule_set_ids,
+                    timeout=self._query_timeout_seconds,
+                )
+                rule_set_featured_rows = await connection.fetch(
+                    RULE_SET_FEATURED_RULES_SQL,
+                    rule_set_ids,
+                    timeout=self._query_timeout_seconds,
+                )
+                rule_set_pity_rows = await connection.fetch(
+                    RULE_SET_PITY_RULES_SQL,
+                    rule_set_ids,
                     timeout=self._query_timeout_seconds,
                 )
                 pity_rows = await connection.fetch(
@@ -123,6 +145,9 @@ class PostgresCatalogRepository:
             rarity_rows=rarity_rows,
             featured_rows=featured_rows,
             pity_rows=pity_rows,
+            rule_set_rarity_rows=rule_set_rarity_rows,
+            rule_set_featured_rows=rule_set_featured_rows,
+            rule_set_pity_rows=rule_set_pity_rows,
         )
 
     async def _ensure_pool(self) -> Any:
@@ -157,6 +182,9 @@ def _build_snapshot(
     rarity_rows: list[Any],
     featured_rows: list[Any],
     pity_rows: list[Any],
+    rule_set_rarity_rows: list[Any] | None = None,
+    rule_set_featured_rows: list[Any] | None = None,
+    rule_set_pity_rows: list[Any] | None = None,
 ) -> CatalogSnapshot:
     items = tuple(_item_from_row(row) for row in item_rows)
     item_by_id = {item.id: item for item in items}
@@ -200,10 +228,16 @@ def _build_snapshot(
             resets_lower_rarity=bool(row["resets_lower_rarity"]),
         )
 
+    rarity_by_rule_set = _rarity_rates_by_owner(rule_set_rarity_rows or [], "rule_set_id")
+    featured_by_rule_set = _featured_rules_by_owner(rule_set_featured_rows or [], "rule_set_id")
+    pity_by_rule_set = _pity_rules_by_owner(rule_set_pity_rows or [], "rule_set_id")
+
     banners: list[Banner] = []
     configs: dict[str, BannerConfig] = {}
     for row in banner_rows:
         version_id = str(row["banner_version_id"])
+        raw_rule_set_id = _optional_row_value(row, "rule_set_id")
+        rule_set_id = str(raw_rule_set_id) if raw_rule_set_id is not None else None
         banner_items = banner_items_by_version.get(version_id, [])
         if not banner_items:
             raise CatalogLoadError(f"banner version {version_id} has no items")
@@ -235,8 +269,21 @@ def _build_snapshot(
             theme=BannerTheme(**_json_object(row["theme"])),
         )
 
-        rates = rarity_by_version.get(version_id, {})
-        pity_rules = pity_by_version.get(version_id, {})
+        rates = (
+            rarity_by_rule_set.get(rule_set_id, {})
+            if rule_set_id is not None and rule_set_id in rarity_by_rule_set
+            else rarity_by_version.get(version_id, {})
+        )
+        featured_rules = (
+            featured_by_rule_set.get(rule_set_id, {})
+            if rule_set_id is not None and rule_set_id in featured_by_rule_set
+            else featured_by_version.get(version_id, {})
+        )
+        pity_rules = (
+            pity_by_rule_set.get(rule_set_id, {})
+            if rule_set_id is not None and rule_set_id in pity_by_rule_set
+            else pity_by_version.get(version_id, {})
+        )
         _validate_runtime_banner_config(
             banner=banner,
             banner_version_id=version_id,
@@ -252,7 +299,7 @@ def _build_snapshot(
             all_items=items,
             item_by_id=item_by_id,
             rarity_rates=rates,
-            featured_rules=featured_by_version.get(version_id, {}),
+            featured_rules=featured_rules,
             pity_rules=pity_rules,
             featured_item_ids_by_rarity={
                 rarity: tuple(ids) for rarity, ids in featured_by_rarity.items()
@@ -285,6 +332,48 @@ def _validate_runtime_banner_config(
         raise CatalogLoadError(f"banner version {banner_version_id} item_pool is empty")
 
 
+def _rarity_rates_by_owner(rows: list[Any], owner_key: str) -> dict[str, dict[int, RarityRate]]:
+    rates_by_owner: dict[str, dict[int, RarityRate]] = {}
+    for row in rows:
+        owner_id = str(row[owner_key])
+        rates_by_owner.setdefault(owner_id, {})[int(row["rarity"])] = RarityRate(
+            rarity=int(row["rarity"]),
+            base_rate_ppm=int(row["base_rate_ppm"]),
+            roll_order=int(row["roll_order"]),
+        )
+    return rates_by_owner
+
+
+def _featured_rules_by_owner(rows: list[Any], owner_key: str) -> dict[str, dict[int, FeaturedRule]]:
+    rules_by_owner: dict[str, dict[int, FeaturedRule]] = {}
+    for row in rows:
+        owner_id = str(row[owner_key])
+        rules_by_owner.setdefault(owner_id, {})[int(row["rarity"])] = FeaturedRule(
+            rarity=int(row["rarity"]),
+            featured_group=str(row["featured_group"]),
+            featured_rate_ppm=int(row["featured_rate_ppm"]),
+            guarantee_after_miss=bool(row["guarantee_after_miss"]),
+            miss_sets_guarantee=bool(row["miss_sets_guarantee"]),
+            guarantee_state_key=row["guarantee_state_key"],
+        )
+    return rules_by_owner
+
+
+def _pity_rules_by_owner(rows: list[Any], owner_key: str) -> dict[str, dict[int, PityRule]]:
+    rules_by_owner: dict[str, dict[int, PityRule]] = {}
+    for row in rows:
+        owner_id = str(row[owner_key])
+        rules_by_owner.setdefault(owner_id, {})[int(row["rarity"])] = PityRule(
+            rarity=int(row["rarity"]),
+            counter_key=str(row["counter_key"]),
+            hard_pity=int(row["hard_pity"]),
+            soft_pity_start=row["soft_pity_start"],
+            soft_pity_increment_ppm=int(row["soft_pity_increment_ppm"]),
+            resets_lower_rarity=bool(row["resets_lower_rarity"]),
+        )
+    return rules_by_owner
+
+
 def _item_from_row(row: Any) -> GachaItem:
     return GachaItem(
         id=str(row["id"]),
@@ -298,6 +387,16 @@ def _item_from_row(row: Any) -> GachaItem:
         accent=str(row["accent"]),
         quote=str(row["quote"]),
     )
+
+
+def _optional_row_value(row: Any, key: str) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+
+    try:
+        return row[key]
+    except KeyError:
+        return None
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -323,6 +422,7 @@ BANNERS_SQL = """
 select
   bv.id::text as banner_version_id,
   bv.banner_id,
+  bv.rule_set_id,
   bv.version,
   b.name,
   b.short_name,
@@ -376,4 +476,37 @@ select
   resets_lower_rarity
 from gacha.pity_rules
 where banner_version_id::text = any($1::text[])
+"""
+
+RULE_SET_RARITY_RATES_SQL = """
+select rule_set_id, rarity, base_rate_ppm, roll_order
+from gacha.rule_set_rarity_rates
+where rule_set_id = any($1::text[])
+order by rule_set_id, roll_order
+"""
+
+RULE_SET_FEATURED_RULES_SQL = """
+select
+  rule_set_id,
+  rarity,
+  featured_group,
+  featured_rate_ppm,
+  guarantee_after_miss,
+  miss_sets_guarantee,
+  guarantee_state_key
+from gacha.rule_set_featured_rules
+where rule_set_id = any($1::text[])
+"""
+
+RULE_SET_PITY_RULES_SQL = """
+select
+  rule_set_id,
+  rarity,
+  counter_key,
+  hard_pity,
+  soft_pity_start,
+  soft_pity_increment_ppm,
+  resets_lower_rarity
+from gacha.rule_set_pity_rules
+where rule_set_id = any($1::text[])
 """
