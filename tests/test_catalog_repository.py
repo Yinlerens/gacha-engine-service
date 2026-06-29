@@ -2,7 +2,34 @@ from __future__ import annotations
 
 import unittest
 
-from gacha_engine_service.catalog_repository import _build_snapshot
+from gacha_engine_service.catalog_repository import PostgresCatalogRepository, _build_snapshot
+
+
+class FakeAcquireContext:
+    def __init__(self, connection: FakeConnection) -> None:
+        self._connection = connection
+
+    async def __aenter__(self) -> FakeConnection:
+        return self._connection
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class FakeConnection:
+    def __init__(self, fetch_results: list[list[dict[str, object]]]) -> None:
+        self._fetch_results = fetch_results
+
+    async def fetch(self, *_: object, **__: object) -> list[dict[str, object]]:
+        return self._fetch_results.pop(0)
+
+
+class FakePool:
+    def __init__(self, connection: FakeConnection) -> None:
+        self._connection = connection
+
+    def acquire(self) -> FakeAcquireContext:
+        return FakeAcquireContext(self._connection)
 
 
 class CatalogRepositoryTests(unittest.TestCase):
@@ -232,6 +259,48 @@ class CatalogRepositoryTests(unittest.TestCase):
         self.assertEqual(banner_config.pity_rules[5].hard_pity, 80)
         self.assertEqual(banner_config.pity_rules[5].soft_pity_start, 66)
         self.assertEqual(banner_config.featured_rules[5].featured_rate_ppm, 500000)
+
+
+class PostgresCatalogRepositoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_load_snapshot_allows_no_current_banner_versions(self) -> None:
+        item_rows = [
+            {
+                "id": "item-1",
+                "name": "Item",
+                "subtitle": "",
+                "rarity": 3,
+                "item_type": "weapon",
+                "element": "",
+                "role": "",
+                "faction": "",
+                "accent": "#aaa",
+                "quote": "",
+            }
+        ]
+        connection = FakeConnection(
+            [
+                item_rows,
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            ]
+        )
+        repository = PostgresCatalogRepository(
+            database_url="postgres://example",
+            pool_size=1,
+            query_timeout_seconds=1,
+        )
+        repository._pool = FakePool(connection)
+
+        snapshot = await repository.load_snapshot()
+
+        self.assertEqual(snapshot.banners, ())
+        self.assertEqual(snapshot.banner_configs_by_id, {})
 
 
 if __name__ == "__main__":

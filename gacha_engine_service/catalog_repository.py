@@ -87,8 +87,6 @@ class PostgresCatalogRepository:
             async with pool.acquire() as connection:
                 items_rows = await connection.fetch(ITEMS_SQL, timeout=self._query_timeout_seconds)
                 banner_rows = await connection.fetch(BANNERS_SQL, timeout=self._query_timeout_seconds)
-                if not banner_rows:
-                    raise CatalogLoadError("no published gacha banner versions were found")
 
                 version_ids = [str(row["banner_version_id"]) for row in banner_rows]
                 banner_item_rows = await connection.fetch(
