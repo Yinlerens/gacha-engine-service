@@ -33,6 +33,20 @@ class FakePool:
 
 
 class CatalogRepositoryTests(unittest.TestCase):
+    def test_build_snapshot_allows_empty_catalog(self) -> None:
+        snapshot = _build_snapshot(
+            item_rows=[],
+            banner_rows=[],
+            banner_item_rows=[],
+            rarity_rows=[],
+            featured_rows=[],
+            pity_rows=[],
+        )
+
+        self.assertEqual(snapshot.items, ())
+        self.assertEqual(snapshot.banners, ())
+        self.assertEqual(snapshot.banner_configs_by_id, {})
+
     def test_build_snapshot_projects_published_banner_config(self) -> None:
         snapshot = _build_snapshot(
             item_rows=[
@@ -262,24 +276,10 @@ class CatalogRepositoryTests(unittest.TestCase):
 
 
 class PostgresCatalogRepositoryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_load_snapshot_allows_no_current_banner_versions(self) -> None:
-        item_rows = [
-            {
-                "id": "item-1",
-                "name": "Item",
-                "subtitle": "",
-                "rarity": 3,
-                "item_type": "weapon",
-                "element": "",
-                "role": "",
-                "faction": "",
-                "accent": "#aaa",
-                "quote": "",
-            }
-        ]
+    async def test_load_snapshot_allows_empty_current_catalog(self) -> None:
         connection = FakeConnection(
             [
-                item_rows,
+                [],
                 [],
                 [],
                 [],

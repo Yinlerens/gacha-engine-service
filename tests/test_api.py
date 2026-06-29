@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
+from gacha_engine_service.catalog_config import CatalogSnapshot
 from gacha_engine_service.config import Settings
 from gacha_engine_service.main import create_app
 from gacha_engine_service.schemas import PitySnapshot
@@ -22,6 +24,7 @@ def make_client(
     *,
     state_store: FakePityStateStore | None = None,
     event_publisher: FakeEventPublisher | None = None,
+    catalog_repository: object | None = None,
 ) -> tuple[TestClient, FakePityStateStore, FakeEventPublisher]:
     state_store = state_store or FakePityStateStore()
     event_publisher = event_publisher or FakeEventPublisher()
@@ -29,8 +32,23 @@ def make_client(
         settings=Settings(internal_token="test-token"),
         state_store=state_store,
         event_publisher=event_publisher,
+        catalog_repository=catalog_repository,
     )
     return TestClient(app), state_store, event_publisher
+
+
+class EmptyCatalogRepository:
+    async def load_snapshot(self) -> CatalogSnapshot:
+        return CatalogSnapshot(
+            source="test",
+            loaded_at=datetime.now(timezone.utc),
+            items=(),
+            banners=(),
+            banner_configs_by_id={},
+        )
+
+    async def close(self) -> None:
+        return None
 
 
 class ApiTests(unittest.TestCase):
@@ -74,6 +92,30 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["checks"], {"internal_token": "missing"})
+
+    def test_empty_catalog_returns_empty_lists_and_missing_banner_404s(self) -> None:
+        client, _, _ = make_client(catalog_repository=EmptyCatalogRepository())
+
+        ready_response = client.get("/ready")
+        banners_response = client.get("/v1/banners")
+        items_response = client.get("/v1/items")
+        pity_response = client.get("/v1/me/pity?banner_id=missing", headers=HEADERS)
+        pull_response = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "missing", "count": 1},
+            headers=HEADERS,
+        )
+
+        self.assertEqual(ready_response.status_code, 200)
+        self.assertEqual(ready_response.json(), {"status": "ready", "checks": {}})
+        self.assertEqual(banners_response.status_code, 200)
+        self.assertEqual(banners_response.json(), {"items": []})
+        self.assertEqual(items_response.status_code, 200)
+        self.assertEqual(items_response.json(), {"items": []})
+        self.assertEqual(pity_response.status_code, 404)
+        self.assertEqual(pity_response.json()["error"]["code"], "banner_not_found")
+        self.assertEqual(pull_response.status_code, 404)
+        self.assertEqual(pull_response.json()["error"]["code"], "banner_not_found")
 
     def test_pull_requires_gateway_token(self) -> None:
         client, _, _ = make_client()

@@ -186,8 +186,6 @@ def _build_snapshot(
 ) -> CatalogSnapshot:
     items = tuple(_item_from_row(row) for row in item_rows)
     item_by_id = {item.id: item for item in items}
-    if not item_by_id:
-        raise CatalogLoadError("no enabled gacha items were found")
 
     banner_items_by_version: dict[str, list[Any]] = {}
     for row in banner_item_rows:
