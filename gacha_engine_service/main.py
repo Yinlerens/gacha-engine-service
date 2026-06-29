@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
-import secrets
+import hashlib
+import json
+import logging
 import uuid
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+from .asset_client import AssetClient, AssetServiceError
 from .auth import authenticate_gateway_request, internal_token_header, user_id_header
 from .catalog_repository import (
     CachedCatalogProvider,
@@ -21,6 +25,7 @@ from .catalog_repository import (
 from .config import Settings
 from .engine import perform_pulls
 from .kafka_events import EventPublishError, KafkaEventPublisher
+from .pull_operations import PullOperation
 from .redis_state import PityStateStoreError, PityVersionConflict, RedisPityStateStore
 from .schemas import (
     ErrorResponse,
@@ -33,13 +38,27 @@ from .schemas import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
+ASTRITE_PER_PULL = 160
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+MAX_IDEMPOTENCY_KEY_LENGTH = 128
+PULL_EVENT_NAMESPACE = uuid.UUID("d19f2db2-5d10-4dbf-95ee-2680ab82d908")
+
+
 class AppServices:
     """Container for external service adapters."""
 
-    def __init__(self, state_store: object, event_publisher: object, catalog_provider: object) -> None:
+    def __init__(
+        self,
+        state_store: object,
+        event_publisher: object,
+        catalog_provider: object,
+        asset_client: object,
+    ) -> None:
         self.state_store = state_store
         self.event_publisher = event_publisher
         self.catalog_provider = catalog_provider
+        self.asset_client = asset_client
 
 
 def create_app(
@@ -48,17 +67,20 @@ def create_app(
     state_store: object | None = None,
     event_publisher: object | None = None,
     catalog_repository: CatalogRepository | None = None,
+    asset_client: object | None = None,
 ) -> FastAPI:
     """Create a FastAPI app with injectable external adapters."""
 
     settings = settings or Settings.from_env()
     owns_state_store = state_store is None
     owns_event_publisher = event_publisher is None
+    owns_asset_client = asset_client is None
 
     if state_store is None:
         state_store = RedisPityStateStore(
             redis_url=settings.redis_url,
             key_prefix=settings.redis_key_prefix,
+            pull_operation_ttl_seconds=settings.pull_operation_ttl_seconds,
         )
 
     if event_publisher is None:
@@ -66,6 +88,13 @@ def create_app(
             bootstrap_servers=settings.kafka_bootstrap_servers,
             topic=settings.kafka_topic,
             client_id=settings.kafka_client_id,
+        )
+
+    if asset_client is None:
+        asset_client = AssetClient(
+            base_url=settings.asset_service_url,
+            internal_token=settings.asset_internal_token or settings.internal_token,
+            timeout_seconds=settings.asset_request_timeout_seconds,
         )
 
     catalog_provider = CachedCatalogProvider(
@@ -79,6 +108,8 @@ def create_app(
             yield
         finally:
             await catalog_provider.close()
+            if owns_asset_client and hasattr(asset_client, "close"):
+                await asset_client.close()
             if owns_event_publisher and hasattr(event_publisher, "close"):
                 await event_publisher.close()
             if owns_state_store and hasattr(state_store, "close"):
@@ -91,7 +122,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = settings
-    app.state.services = AppServices(state_store, event_publisher, catalog_provider)
+    app.state.services = AppServices(state_store, event_publisher, catalog_provider, asset_client)
 
     register_exception_handlers(app)
     register_routes(app)
@@ -130,6 +161,11 @@ def register_routes(app: FastAPI) -> None:
             await services.event_publisher.ping()
         except Exception:
             checks["kafka"] = "unavailable"
+
+        try:
+            await services.asset_client.ping()
+        except Exception:
+            checks["asset_service"] = "unavailable"
 
         try:
             await services.catalog_provider.ping()
@@ -181,6 +217,7 @@ def register_routes(app: FastAPI) -> None:
         pull_request: PullRequest,
         request: Request,
         user_id: UUID = Depends(current_user_id),
+        idempotency_key: str = Depends(idempotency_key_header),
     ) -> PullResponse:
         snapshot = await current_catalog_snapshot(request)
         banner_config = snapshot.banner_configs_by_id.get(pull_request.banner_id)
@@ -192,7 +229,69 @@ def register_routes(app: FastAPI) -> None:
         banner = banner_config.banner
 
         services: AppServices = request.app.state.services
-        seed = pull_request.seed or secrets.token_urlsafe(24)
+        seed = pull_request.seed or deterministic_pull_seed(user_id, idempotency_key)
+        request_hash = pull_request_hash(
+            banner_id=banner.id,
+            count=pull_request.count,
+            seed=seed,
+        )
+        cost_minor = pull_request.count * ASTRITE_PER_PULL
+        event_id = deterministic_pull_event_id(user_id, idempotency_key)
+
+        try:
+            existing_operation = await services.state_store.begin_pull_operation(
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+        except PityStateStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "redis_unavailable", "message": "pull idempotency is unavailable"},
+            ) from exc
+
+        if existing_operation is not None:
+            return await handle_existing_pull_operation(
+                operation=existing_operation,
+                services=services,
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                event_id=event_id,
+                amount_minor=cost_minor,
+                metadata=pull_asset_metadata(
+                    event_id=event_id,
+                    banner_id=banner.id,
+                    banner_version_id=banner_config.banner_version_id,
+                    count=pull_request.count,
+                ),
+            )
+
+        metadata = pull_asset_metadata(
+            event_id=event_id,
+            banner_id=banner.id,
+            banner_version_id=banner_config.banner_version_id,
+            count=pull_request.count,
+        )
+
+        try:
+            await services.asset_client.spend(
+                user_id=user_id,
+                amount_minor=cost_minor,
+                idempotency_key=spend_idempotency_key(event_id),
+                reason="gacha_pull",
+                metadata=metadata,
+            )
+        except AssetServiceError as exc:
+            await mark_pull_operation_failed(
+                services=services,
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                code=asset_error_code(exc),
+                message=asset_error_message(exc),
+            )
+            raise asset_http_exception(exc) from exc
 
         try:
             previous_pity = await services.state_store.get_snapshot(user_id, banner.id)
@@ -202,13 +301,57 @@ def register_routes(app: FastAPI) -> None:
                 pity=previous_pity.without_version(),
                 seed=seed,
             )
-            next_pity = await services.state_store.compare_and_set(
+            next_pity = PitySnapshot(
+                **next_pity_state.model_dump(),
+                version=previous_pity.version + 1,
+            )
+            response = PullResponse(
+                event_id=event_id,
+                banner_version_id=banner_config.banner_version_id,
+                seed=seed,
+                records=records,
+                previous_pity=previous_pity,
+                next_pity=next_pity,
+                state_version=next_pity.version,
+            )
+            event = PullCompletedEvent(
+                event_id=event_id,
+                user_id=str(user_id),
+                banner_id=banner.id,
+                banner_version_id=banner_config.banner_version_id,
+                seed=seed,
+                records=records,
+                previous_pity=previous_pity,
+                next_pity=next_pity,
+                state_version=next_pity.version,
+            )
+            pending_operation = PullOperation(
+                status="event_pending",
+                request_hash=request_hash,
+                response=response,
+                event=event,
+            )
+            await services.state_store.compare_and_set_with_pull_operation(
                 user_id=user_id,
                 banner_id=banner.id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
                 expected_version=previous_pity.version,
                 next_pity=next_pity_state,
+                operation=pending_operation,
             )
         except PityVersionConflict as exc:
+            await refund_spend(
+                services=services,
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                event_id=event_id,
+                amount_minor=cost_minor,
+                metadata=metadata,
+                code="pity_version_conflict",
+                message=f"pity state was updated at version {exc.current_version}",
+            )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
@@ -217,35 +360,24 @@ def register_routes(app: FastAPI) -> None:
                 },
             ) from exc
         except PityStateStoreError as exc:
+            await refund_spend(
+                services=services,
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                event_id=event_id,
+                amount_minor=cost_minor,
+                metadata=metadata,
+                code="redis_unavailable",
+                message="pity state is unavailable",
+            )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "redis_unavailable", "message": "pity state is unavailable"},
             ) from exc
 
-        event_id = str(uuid.uuid4())
-        response = PullResponse(
-            event_id=event_id,
-            banner_version_id=banner_config.banner_version_id,
-            seed=seed,
-            records=records,
-            previous_pity=previous_pity,
-            next_pity=next_pity,
-            state_version=next_pity.version,
-        )
-        event = PullCompletedEvent(
-            event_id=event_id,
-            user_id=str(user_id),
-            banner_id=banner.id,
-            banner_version_id=banner_config.banner_version_id,
-            seed=seed,
-            records=records,
-            previous_pity=previous_pity,
-            next_pity=next_pity,
-            state_version=next_pity.version,
-        )
-
         try:
-            await services.event_publisher.publish_pull_completed(event)
+            await publish_pull_completed_with_retry(services.event_publisher, event)
         except EventPublishError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -254,6 +386,18 @@ def register_routes(app: FastAPI) -> None:
                     "message": "pull event could not be published",
                 },
             ) from exc
+
+        await save_pull_operation_best_effort(
+            services=services,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            operation=PullOperation(
+                status="succeeded",
+                request_hash=request_hash,
+                response=response,
+                event=event,
+            ),
+        )
 
         return response
 
@@ -291,6 +435,297 @@ def current_user_id(
         internal_token=internal_token,
         user_id=user_id,
     )
+
+
+def idempotency_key_header(
+    value: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+) -> str:
+    idempotency_key = (value or "").strip()
+    if not idempotency_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "missing_idempotency_key", "message": "Idempotency-Key header is required"},
+        )
+    if len(idempotency_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_idempotency_key",
+                "message": "Idempotency-Key must be 128 characters or fewer",
+            },
+        )
+    return idempotency_key
+
+
+async def handle_existing_pull_operation(
+    *,
+    operation: PullOperation,
+    services: AppServices,
+    user_id: UUID,
+    idempotency_key: str,
+    request_hash: str,
+    event_id: str,
+    amount_minor: int,
+    metadata: dict[str, object],
+) -> PullResponse:
+    if operation.request_hash != request_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "idempotency_conflict",
+                "message": "Idempotency-Key was already used with a different request",
+            },
+        )
+
+    if operation.status == "succeeded" and operation.response is not None:
+        return operation.response
+
+    if operation.status == "event_pending" and operation.response is not None and operation.event is not None:
+        try:
+            await publish_pull_completed_with_retry(services.event_publisher, operation.event)
+        except EventPublishError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "kafka_unavailable", "message": "pull event could not be published"},
+            ) from exc
+
+        await save_pull_operation_best_effort(
+            services=services,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            operation=PullOperation(
+                status="succeeded",
+                request_hash=request_hash,
+                response=operation.response,
+                event=operation.event,
+            ),
+        )
+        return operation.response
+
+    if operation.status == "refund_pending":
+        await refund_spend(
+            services=services,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            event_id=event_id,
+            amount_minor=amount_minor,
+            metadata=metadata,
+            code=operation.error_code or "pull_refunded",
+            message=operation.error_message or "pull was refunded",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "pull_refunded",
+                "message": "previous pull attempt was refunded; retry with a new Idempotency-Key",
+            },
+        )
+
+    if operation.status == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": operation.error_code or "pull_failed",
+                "message": operation.error_message or "previous pull attempt failed; retry with a new Idempotency-Key",
+            },
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "pull_in_progress", "message": "pull is already in progress"},
+    )
+
+
+async def refund_spend(
+    *,
+    services: AppServices,
+    user_id: UUID,
+    idempotency_key: str,
+    request_hash: str,
+    event_id: str,
+    amount_minor: int,
+    metadata: dict[str, object],
+    code: str,
+    message: str,
+) -> None:
+    try:
+        await services.asset_client.credit(
+            user_id=user_id,
+            amount_minor=amount_minor,
+            idempotency_key=refund_idempotency_key(event_id),
+            reason="gacha_pull_refund",
+            metadata={**metadata, "refund_reason": code},
+        )
+    except AssetServiceError as exc:
+        await save_pull_operation_best_effort(
+            services=services,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            operation=PullOperation(
+                status="refund_pending",
+                request_hash=request_hash,
+                error_code=code,
+                error_message=message,
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "asset_refund_unavailable",
+                "message": "asset refund could not be completed",
+            },
+        ) from exc
+
+    await mark_pull_operation_failed(
+        services=services,
+        user_id=user_id,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        code=code,
+        message=message,
+    )
+
+
+async def mark_pull_operation_failed(
+    *,
+    services: AppServices,
+    user_id: UUID,
+    idempotency_key: str,
+    request_hash: str,
+    code: str,
+    message: str,
+) -> None:
+    await save_pull_operation_best_effort(
+        services=services,
+        user_id=user_id,
+        idempotency_key=idempotency_key,
+        operation=PullOperation(
+            status="failed",
+            request_hash=request_hash,
+            error_code=code,
+            error_message=message,
+        ),
+    )
+
+
+async def save_pull_operation_best_effort(
+    *,
+    services: AppServices,
+    user_id: UUID,
+    idempotency_key: str,
+    operation: PullOperation,
+) -> None:
+    try:
+        await services.state_store.save_pull_operation(
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            operation=operation,
+        )
+    except PityStateStoreError:
+        LOGGER.warning("failed to save pull operation status", exc_info=True)
+
+
+async def publish_pull_completed_with_retry(event_publisher: object, event: PullCompletedEvent) -> None:
+    last_error: EventPublishError | None = None
+    for attempt in range(3):
+        try:
+            await event_publisher.publish_pull_completed(event)
+            return
+        except EventPublishError as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(0.2 * (2**attempt))
+
+    if last_error is not None:
+        raise last_error
+
+
+def asset_http_exception(exc: AssetServiceError) -> HTTPException:
+    if exc.code == "insufficient_funds":
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "insufficient_assets", "message": "星声不足，请先充值。"},
+        )
+    if exc.code == "idempotency_conflict":
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "idempotency_conflict",
+                "message": "Idempotency-Key was already used with a different request",
+            },
+        )
+
+    if exc.status_code >= 500:
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "asset_unavailable", "message": "asset service is unavailable"},
+        )
+
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": asset_error_code(exc), "message": asset_error_message(exc)},
+    )
+
+
+def asset_error_code(exc: AssetServiceError) -> str:
+    if exc.code == "insufficient_funds":
+        return "insufficient_assets"
+    return exc.code or "asset_request_failed"
+
+
+def asset_error_message(exc: AssetServiceError) -> str:
+    if exc.code == "insufficient_funds":
+        return "星声不足，请先充值。"
+    return exc.message or "asset request failed"
+
+
+def pull_asset_metadata(
+    *,
+    event_id: str,
+    banner_id: str,
+    banner_version_id: str | None,
+    count: int,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "source": "gacha-engine-service",
+        "event_id": event_id,
+        "banner_id": banner_id,
+        "count": count,
+        "cost_per_pull_minor": ASTRITE_PER_PULL,
+    }
+    if banner_version_id is not None:
+        metadata["banner_version_id"] = banner_version_id
+    return metadata
+
+
+def pull_request_hash(*, banner_id: str, count: int, seed: str) -> str:
+    payload = json.dumps(
+        {
+            "banner_id": banner_id,
+            "count": count,
+            "seed": seed,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def deterministic_pull_event_id(user_id: UUID, idempotency_key: str) -> str:
+    return str(uuid.uuid5(PULL_EVENT_NAMESPACE, f"event:{user_id}:{idempotency_key}"))
+
+
+def deterministic_pull_seed(user_id: UUID, idempotency_key: str) -> str:
+    return str(uuid.uuid5(PULL_EVENT_NAMESPACE, f"seed:{user_id}:{idempotency_key}"))
+
+
+def spend_idempotency_key(event_id: str) -> str:
+    return f"gacha-pull:{event_id}"
+
+
+def refund_idempotency_key(event_id: str) -> str:
+    return f"gacha-refund:{event_id}"
 
 
 def write_error(status_code: int, code: str, message: str) -> JSONResponse:

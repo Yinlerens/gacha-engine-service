@@ -65,6 +65,13 @@ spec:
                 secretKeyRef:
                   name: gacha-engine-service-secrets
                   key: gacha-config-database-url
+            - name: ASSET_SERVICE_URL
+              value: http://asset-service.asset-service.svc.cluster.local
+            - name: ASSET_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gacha-engine-service-secrets
+                  key: internal-token
           startupProbe:
             httpGet:
               port: http

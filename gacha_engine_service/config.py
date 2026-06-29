@@ -30,6 +30,10 @@ class Settings:
     gacha_config_cache_ttl_seconds: int = 30
     gacha_config_query_timeout_seconds: int = 5
     gacha_config_pool_size: int = 2
+    asset_service_url: str = "http://asset-service.asset-service.svc.cluster.local"
+    asset_internal_token: str = ""
+    asset_request_timeout_seconds: int = 5
+    pull_operation_ttl_seconds: int = 86400
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -63,6 +67,19 @@ class Settings:
                 cls.gacha_config_query_timeout_seconds,
             ),
             gacha_config_pool_size=_int_env("GACHA_CONFIG_POOL_SIZE", cls.gacha_config_pool_size),
+            asset_service_url=(
+                os.getenv("ASSET_SERVICE_URL", cls.asset_service_url).strip()
+                or cls.asset_service_url
+            ),
+            asset_internal_token=os.getenv("ASSET_INTERNAL_TOKEN", "").strip(),
+            asset_request_timeout_seconds=_int_env(
+                "ASSET_REQUEST_TIMEOUT_SECONDS",
+                cls.asset_request_timeout_seconds,
+            ),
+            pull_operation_ttl_seconds=_int_env(
+                "PULL_OPERATION_TTL_SECONDS",
+                cls.pull_operation_ttl_seconds,
+            ),
         )
 
 
