@@ -34,6 +34,10 @@ class Settings:
     asset_internal_token: str = ""
     asset_request_timeout_seconds: int = 5
     pull_operation_ttl_seconds: int = 86400
+    pending_event_recovery_enabled: bool = True
+    pending_event_recovery_interval_seconds: int = 5
+    pending_event_recovery_batch_size: int = 100
+    pending_event_recovery_lock_ttl_seconds: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -80,6 +84,22 @@ class Settings:
                 "PULL_OPERATION_TTL_SECONDS",
                 cls.pull_operation_ttl_seconds,
             ),
+            pending_event_recovery_enabled=_bool_env(
+                "PENDING_EVENT_RECOVERY_ENABLED",
+                cls.pending_event_recovery_enabled,
+            ),
+            pending_event_recovery_interval_seconds=_int_env(
+                "PENDING_EVENT_RECOVERY_INTERVAL_SECONDS",
+                cls.pending_event_recovery_interval_seconds,
+            ),
+            pending_event_recovery_batch_size=_int_env(
+                "PENDING_EVENT_RECOVERY_BATCH_SIZE",
+                cls.pending_event_recovery_batch_size,
+            ),
+            pending_event_recovery_lock_ttl_seconds=_int_env(
+                "PENDING_EVENT_RECOVERY_LOCK_TTL_SECONDS",
+                cls.pending_event_recovery_lock_ttl_seconds,
+            ),
         )
 
 
@@ -111,3 +131,16 @@ def _non_negative_int_env(name: str, default: int) -> int:
     if parsed < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return parsed
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(f"{name} must be a boolean")

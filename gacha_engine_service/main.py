@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 import hashlib
 import json
 import logging
+import time
 import uuid
 from uuid import UUID
 
@@ -41,6 +42,7 @@ from .schemas import (
 LOGGER = logging.getLogger(__name__)
 ASTRITE_PER_PULL = 160
 IDEMPOTENCY_HEADER = "Idempotency-Key"
+REQUEST_ID_HEADER = "X-Request-Id"
 MAX_IDEMPOTENCY_KEY_LENGTH = 128
 PULL_EVENT_NAMESPACE = uuid.UUID("d19f2db2-5d10-4dbf-95ee-2680ab82d908")
 
@@ -104,9 +106,31 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        recovery_task: asyncio.Task[None] | None = None
+        if settings.pending_event_recovery_enabled:
+            recovery_task = asyncio.create_task(
+                run_pending_event_recovery_worker(
+                    services=AppServices(
+                        state_store,
+                        event_publisher,
+                        catalog_provider,
+                        asset_client,
+                    ),
+                    interval_seconds=settings.pending_event_recovery_interval_seconds,
+                    batch_size=settings.pending_event_recovery_batch_size,
+                    lock_ttl_seconds=settings.pending_event_recovery_lock_ttl_seconds,
+                ),
+                name="pending-event-recovery",
+            )
         try:
             yield
         finally:
+            if recovery_task is not None:
+                recovery_task.cancel()
+                try:
+                    await recovery_task
+                except asyncio.CancelledError:
+                    pass
             await catalog_provider.close()
             if owns_asset_client and hasattr(asset_client, "close"):
                 await asset_client.close()
@@ -124,9 +148,45 @@ def create_app(
     app.state.settings = settings
     app.state.services = AppServices(state_store, event_publisher, catalog_provider, asset_client)
 
+    register_access_log(app)
     register_exception_handlers(app)
     register_routes(app)
     return app
+
+
+def register_access_log(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def access_log_middleware(request: Request, call_next):
+        started = time.monotonic()
+        request_id = request_id_from_header(request.headers.get(REQUEST_ID_HEADER))
+        request.state.request_id = request_id
+
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            LOGGER.exception(
+                "http request failed request_id=%s method=%s path=%s duration_ms=%s client_ip=%s",
+                request_id,
+                request.method,
+                request.url.path,
+                duration_ms,
+                request.client.host if request.client else "",
+            )
+            raise
+
+        response.headers[REQUEST_ID_HEADER] = request_id
+        duration_ms = int((time.monotonic() - started) * 1000)
+        LOGGER.info(
+            "http request request_id=%s method=%s path=%s status=%s duration_ms=%s client_ip=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            request.client.host if request.client else "",
+        )
+        return response
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -219,6 +279,7 @@ def register_routes(app: FastAPI) -> None:
         user_id: UUID = Depends(current_user_id),
         idempotency_key: str = Depends(idempotency_key_header),
     ) -> PullResponse:
+        request_id = request_id_from_state(request)
         snapshot = await current_catalog_snapshot(request)
         banner_config = snapshot.banner_configs_by_id.get(pull_request.banner_id)
         if banner_config is None:
@@ -259,6 +320,7 @@ def register_routes(app: FastAPI) -> None:
                 request_hash=request_hash,
                 event_id=event_id,
                 amount_minor=cost_minor,
+                request_id=request_id,
                 metadata=pull_asset_metadata(
                     event_id=event_id,
                     banner_id=banner.id,
@@ -281,8 +343,15 @@ def register_routes(app: FastAPI) -> None:
                 idempotency_key=spend_idempotency_key(event_id),
                 reason="gacha_pull",
                 metadata=metadata,
+                request_id=request_id,
             )
         except AssetServiceError as exc:
+            LOGGER.warning(
+                "asset spend failed request_id=%s status=%s code=%s",
+                request_id,
+                exc.status_code,
+                exc.code,
+            )
             await mark_pull_operation_failed(
                 services=services,
                 user_id=user_id,
@@ -349,6 +418,7 @@ def register_routes(app: FastAPI) -> None:
                 event_id=event_id,
                 amount_minor=cost_minor,
                 metadata=metadata,
+                request_id=request_id,
                 code="pity_version_conflict",
                 message=f"pity state was updated at version {exc.current_version}",
             )
@@ -368,6 +438,7 @@ def register_routes(app: FastAPI) -> None:
                 event_id=event_id,
                 amount_minor=cost_minor,
                 metadata=metadata,
+                request_id=request_id,
                 code="redis_unavailable",
                 message="pity state is unavailable",
             )
@@ -466,6 +537,7 @@ async def handle_existing_pull_operation(
     request_hash: str,
     event_id: str,
     amount_minor: int,
+    request_id: str,
     metadata: dict[str, object],
 ) -> PullResponse:
     if operation.request_hash != request_hash:
@@ -510,6 +582,7 @@ async def handle_existing_pull_operation(
             request_hash=request_hash,
             event_id=event_id,
             amount_minor=amount_minor,
+            request_id=request_id,
             metadata=metadata,
             code=operation.error_code or "pull_refunded",
             message=operation.error_message or "pull was refunded",
@@ -546,6 +619,7 @@ async def refund_spend(
     event_id: str,
     amount_minor: int,
     metadata: dict[str, object],
+    request_id: str,
     code: str,
     message: str,
 ) -> None:
@@ -556,8 +630,15 @@ async def refund_spend(
             idempotency_key=refund_idempotency_key(event_id),
             reason="gacha_pull_refund",
             metadata={**metadata, "refund_reason": code},
+            request_id=request_id,
         )
     except AssetServiceError as exc:
+        LOGGER.warning(
+            "asset refund failed request_id=%s status=%s code=%s",
+            request_id,
+            exc.status_code,
+            exc.code,
+        )
         await save_pull_operation_best_effort(
             services=services,
             user_id=user_id,
@@ -624,6 +705,113 @@ async def save_pull_operation_best_effort(
         )
     except PityStateStoreError:
         LOGGER.warning("failed to save pull operation status", exc_info=True)
+
+
+async def run_pending_event_recovery_worker(
+    *,
+    services: AppServices,
+    interval_seconds: int,
+    batch_size: int,
+    lock_ttl_seconds: int,
+) -> None:
+    while True:
+        await asyncio.sleep(max(1, interval_seconds))
+        try:
+            recovered_count = await recover_pending_pull_events_once(
+                services,
+                limit=batch_size,
+                lock_ttl_seconds=lock_ttl_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("pending pull event recovery worker failed")
+            continue
+
+        if recovered_count:
+            LOGGER.info("recovered pending pull events count=%s", recovered_count)
+
+
+async def recover_pending_pull_events_once(
+    services: AppServices,
+    *,
+    limit: int,
+    lock_ttl_seconds: int,
+) -> int:
+    try:
+        pending_operations = await services.state_store.iter_event_pending_pull_operations(
+            limit=limit,
+        )
+    except PityStateStoreError:
+        LOGGER.warning("failed to scan pending pull operations", exc_info=True)
+        return 0
+
+    recovered_count = 0
+    for record in pending_operations:
+        operation = record.operation
+        if (
+            operation.status != "event_pending"
+            or operation.response is None
+            or operation.event is None
+        ):
+            continue
+
+        event_id = operation.event.event_id
+        try:
+            claimed = await services.state_store.claim_pull_operation_recovery(
+                operation_key=record.operation_key,
+                lock_ttl_seconds=lock_ttl_seconds,
+            )
+        except PityStateStoreError:
+            LOGGER.warning(
+                "failed to claim pending pull event recovery event_id=%s",
+                event_id,
+                exc_info=True,
+            )
+            continue
+
+        if not claimed:
+            continue
+
+        try:
+            await publish_pull_completed_with_retry(services.event_publisher, operation.event)
+            await services.state_store.save_pull_operation_by_key(
+                operation_key=record.operation_key,
+                operation=PullOperation(
+                    status="succeeded",
+                    request_hash=operation.request_hash,
+                    response=operation.response,
+                    event=operation.event,
+                ),
+            )
+            recovered_count += 1
+        except EventPublishError:
+            LOGGER.warning(
+                "failed to recover pending pull event event_id=%s",
+                event_id,
+                exc_info=True,
+            )
+        except PityStateStoreError:
+            LOGGER.warning(
+                "failed to mark recovered pull operation succeeded event_id=%s",
+                event_id,
+                exc_info=True,
+            )
+        except Exception:
+            LOGGER.exception("unexpected pending pull event recovery failure event_id=%s", event_id)
+        finally:
+            try:
+                await services.state_store.release_pull_operation_recovery(
+                    operation_key=record.operation_key,
+                )
+            except PityStateStoreError:
+                LOGGER.warning(
+                    "failed to release pending pull event recovery lock event_id=%s",
+                    event_id,
+                    exc_info=True,
+                )
+
+    return recovered_count
 
 
 async def publish_pull_completed_with_retry(event_publisher: object, event: PullCompletedEvent) -> None:
@@ -718,6 +906,20 @@ def deterministic_pull_event_id(user_id: UUID, idempotency_key: str) -> str:
 
 def deterministic_pull_seed(user_id: UUID, idempotency_key: str) -> str:
     return str(uuid.uuid5(PULL_EVENT_NAMESPACE, f"seed:{user_id}:{idempotency_key}"))
+
+
+def request_id_from_header(value: str | None) -> str:
+    if value:
+        try:
+            return str(uuid.UUID(value.strip()))
+        except ValueError:
+            pass
+    return str(uuid.uuid4())
+
+
+def request_id_from_state(request: Request) -> str:
+    value = getattr(request.state, "request_id", "")
+    return str(value) if value else ""
 
 
 def spend_idempotency_key(event_id: str) -> str:

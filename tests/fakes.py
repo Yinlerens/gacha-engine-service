@@ -5,7 +5,7 @@ from uuid import UUID
 from gacha_engine_service.asset_client import AssetServiceError
 from gacha_engine_service.engine import create_initial_pity
 from gacha_engine_service.kafka_events import EventPublishError
-from gacha_engine_service.pull_operations import PullOperation
+from gacha_engine_service.pull_operations import PullOperation, PullOperationRecord
 from gacha_engine_service.redis_state import (
     PityStateStoreError,
     PityVersionConflict,
@@ -108,6 +108,41 @@ class FakePityStateStore:
     ) -> None:
         self.operations[(user_id, idempotency_key)] = operation
 
+    async def iter_event_pending_pull_operations(self, *, limit: int) -> list[PullOperationRecord]:
+        records: list[PullOperationRecord] = []
+        for (user_id, idempotency_key), operation in self.operations.items():
+            if operation.status != "event_pending":
+                continue
+            records.append(
+                PullOperationRecord(
+                    operation_key=f"{user_id}:{idempotency_key}",
+                    operation=operation,
+                )
+            )
+            if len(records) >= limit:
+                break
+        return records
+
+    async def claim_pull_operation_recovery(
+        self,
+        *,
+        operation_key: str,
+        lock_ttl_seconds: int,
+    ) -> bool:
+        return True
+
+    async def release_pull_operation_recovery(self, *, operation_key: str) -> None:
+        return None
+
+    async def save_pull_operation_by_key(
+        self,
+        *,
+        operation_key: str,
+        operation: PullOperation,
+    ) -> None:
+        user_id, idempotency_key = operation_key.split(":", 1)
+        self.operations[(UUID(user_id), idempotency_key)] = operation
+
 
 class FakeEventPublisher:
     def __init__(self, *, ping_error: bool = False, publish_error: bool = False) -> None:
@@ -159,6 +194,7 @@ class FakeAssetClient:
         idempotency_key: str,
         reason: str,
         metadata: dict[str, object],
+        request_id: str = "",
     ) -> None:
         if self.spend_error is not None:
             raise self.spend_error
@@ -169,6 +205,7 @@ class FakeAssetClient:
                 "idempotency_key": idempotency_key,
                 "reason": reason,
                 "metadata": metadata,
+                "request_id": request_id,
             }
         )
 
@@ -180,6 +217,7 @@ class FakeAssetClient:
         idempotency_key: str,
         reason: str,
         metadata: dict[str, object],
+        request_id: str = "",
     ) -> None:
         if self.credit_error is not None:
             raise self.credit_error
@@ -190,5 +228,6 @@ class FakeAssetClient:
                 "idempotency_key": idempotency_key,
                 "reason": reason,
                 "metadata": metadata,
+                "request_id": request_id,
             }
         )

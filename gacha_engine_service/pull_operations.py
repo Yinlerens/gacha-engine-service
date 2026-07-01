@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel
@@ -25,3 +26,9 @@ class PullOperation(BaseModel):
     event: PullCompletedEvent | None = None
     error_code: str | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class PullOperationRecord:
+    operation_key: str
+    operation: PullOperation

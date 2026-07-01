@@ -1,24 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime, timezone
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 
 from gacha_engine_service.asset_client import AssetServiceError
 from gacha_engine_service.catalog_config import CatalogSnapshot
 from gacha_engine_service.config import Settings
-from gacha_engine_service.main import create_app
+from gacha_engine_service.main import AppServices, create_app, recover_pending_pull_events_once
 from gacha_engine_service.schemas import PitySnapshot
 
 from .fakes import FakeAssetClient, FakeEventPublisher, FakePityStateStore
 
 
 USER_ID = "ae6b9d2e-9bb0-42c7-950f-c38ab6d7195e"
+REQUEST_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 HEADERS = {
     "X-Internal-Token": "test-token",
     "X-User-Id": USER_ID,
     "Idempotency-Key": "pull-test-1",
+    "X-Request-Id": REQUEST_ID,
 }
 
 
@@ -63,6 +67,7 @@ class ApiTests(unittest.TestCase):
         response = client.get("/health")
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn("x-request-id", response.headers)
         self.assertEqual(response.json(), {"status": "ok"})
 
     def test_ready_returns_ready_when_dependencies_ping(self) -> None:
@@ -206,6 +211,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.spends), 1)
         self.assertEqual(asset_client.spends[0]["amount_minor"], 1600)
         self.assertEqual(asset_client.spends[0]["reason"], "gacha_pull")
+        self.assertEqual(asset_client.spends[0]["request_id"], REQUEST_ID)
+        self.assertEqual(response.headers["x-request-id"], REQUEST_ID)
         self.assertTrue(str(asset_client.spends[0]["idempotency_key"]).startswith("gacha-pull:"))
 
         event = event_publisher.events[0]
@@ -342,6 +349,39 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(state_store.snapshot.version, 1)
         self.assertEqual(len(asset_client.spends), 1)
         self.assertEqual(len(event_publisher.events), 1)
+
+    def test_pending_event_recovery_publishes_and_marks_operation_succeeded(self) -> None:
+        event_publisher = FakeEventPublisher(publish_error=True)
+        client, state_store, event_publisher, asset_client = make_client(
+            event_publisher=event_publisher,
+        )
+
+        response = client.post(
+            "/v1/me/pulls",
+            json={
+                "banner_id": "limited-character-001",
+                "count": 1,
+                "seed": "backend-recovery",
+            },
+            headers=HEADERS,
+        )
+        event_publisher.publish_error = False
+
+        recovered_count = asyncio.run(
+            recover_pending_pull_events_once(
+                AppServices(state_store, event_publisher, object(), asset_client),
+                limit=10,
+                lock_ttl_seconds=30,
+            )
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(recovered_count, 1)
+        self.assertEqual(len(event_publisher.events), 1)
+        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        self.assertEqual(operation.status, "succeeded")
+        self.assertIsNotNone(operation.response)
+        self.assertIsNotNone(operation.event)
 
     def test_get_pity_returns_initial_snapshot(self) -> None:
         client, _, _, _ = make_client(

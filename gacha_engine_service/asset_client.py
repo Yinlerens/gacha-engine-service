@@ -51,6 +51,7 @@ class AssetClient:
         idempotency_key: str,
         reason: str,
         metadata: dict[str, Any],
+        request_id: str = "",
     ) -> None:
         await self._post_entry(
             path="/v1/me/spends",
@@ -59,6 +60,7 @@ class AssetClient:
             idempotency_key=idempotency_key,
             reason=reason,
             metadata=metadata,
+            request_id=request_id,
         )
 
     async def credit(
@@ -69,6 +71,7 @@ class AssetClient:
         idempotency_key: str,
         reason: str,
         metadata: dict[str, Any],
+        request_id: str = "",
     ) -> None:
         await self._post_entry(
             path="/v1/me/credits",
@@ -77,6 +80,7 @@ class AssetClient:
             idempotency_key=idempotency_key,
             reason=reason,
             metadata=metadata,
+            request_id=request_id,
         )
 
     async def _post_entry(
@@ -88,15 +92,20 @@ class AssetClient:
         idempotency_key: str,
         reason: str,
         metadata: dict[str, Any],
+        request_id: str,
     ) -> None:
+        headers = {
+            "X-Internal-Token": self._internal_token,
+            "X-User-Id": str(user_id),
+            "Idempotency-Key": idempotency_key,
+        }
+        if request_id:
+            headers["X-Request-Id"] = request_id
+
         try:
             response = await self._client.post(
                 f"{self._base_url}{path}",
-                headers={
-                    "X-Internal-Token": self._internal_token,
-                    "X-User-Id": str(user_id),
-                    "Idempotency-Key": idempotency_key,
-                },
+                headers=headers,
                 json={
                     "amount_minor": amount_minor,
                     "reason": reason,
