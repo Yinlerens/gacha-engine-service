@@ -30,7 +30,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gacha-engine-service
-          image: ghcr.io/yinlerens/gacha-engine-service@sha256:210c5333ae7ed7f240fd1adabfaafb21e400ad598b8f2fe758714f1332174813
+          image: ghcr.io/yinlerens/gacha-engine-service@sha256:620cdede59a1579a5e2c3af411a9c60e8c65f757a3269955f943639a2e0b9347
           imagePullPolicy: Always
           ports:
             - name: http
