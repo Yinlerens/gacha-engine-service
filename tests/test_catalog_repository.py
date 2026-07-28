@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 
-from gacha_engine_service.catalog_repository import PostgresCatalogRepository, _build_snapshot
+from gacha_engine_service.catalog_repository import (
+    CatalogLoadError,
+    PostgresCatalogRepository,
+    _build_snapshot,
+    _build_snapshot_from_release,
+)
 
 
 class FakeAcquireContext:
@@ -17,11 +23,22 @@ class FakeAcquireContext:
 
 
 class FakeConnection:
-    def __init__(self, fetch_results: list[list[dict[str, object]]]) -> None:
-        self._fetch_results = fetch_results
+    def __init__(
+        self,
+        fetch_results: list[list[dict[str, object]]] | None = None,
+        *,
+        fetchrow_result: dict[str, object] | None = None,
+    ) -> None:
+        self._fetch_results = fetch_results or []
+        self._fetchrow_result = fetchrow_result
+        self.fetchrow_calls: list[tuple[object, ...]] = []
 
     async def fetch(self, *_: object, **__: object) -> list[dict[str, object]]:
         return self._fetch_results.pop(0)
+
+    async def fetchrow(self, *args: object, **__: object) -> dict[str, object] | None:
+        self.fetchrow_calls.append(args)
+        return self._fetchrow_result
 
 
 class FakePool:
@@ -33,6 +50,156 @@ class FakePool:
 
 
 class CatalogRepositoryTests(unittest.TestCase):
+    def test_build_snapshot_from_release_selects_only_effective_version(self) -> None:
+        project_id = "b2000000-b2b2-4b2b-8b2b-b2b2b2b2b2b2"
+        environment_id = "c3000000-c3c3-4c3c-8c3c-c3c3c3c3c3c3"
+        active_version_id = "11111111-1111-4111-8111-111111111111"
+        future_version_id = "22222222-2222-4222-8222-222222222222"
+        release_row = {
+            "release_id": "d4000000-d4d4-4d4d-8d4d-d4d4d4d4d4d4",
+            "checksum_valid": True,
+            "snapshot": {
+                "schema_version": 1,
+                "project_id": project_id,
+                "environment_id": environment_id,
+                "items": [
+                    {
+                        "id": "five",
+                        "name": "Five",
+                        "subtitle": "",
+                        "rarity": 5,
+                        "item_type": "character",
+                        "element": "",
+                        "role": "",
+                        "faction": "",
+                        "accent": "#fff",
+                        "quote": "",
+                    },
+                    {
+                        "id": "four",
+                        "name": "Four",
+                        "subtitle": "",
+                        "rarity": 4,
+                        "item_type": "weapon",
+                        "element": "",
+                        "role": "",
+                        "faction": "",
+                        "accent": "#aaa",
+                        "quote": "",
+                    },
+                ],
+                "banners": [
+                    {
+                        "id": "banner",
+                        "name": "Banner",
+                        "short_name": "Banner",
+                        "banner_type": "standard",
+                        "description": "",
+                        "theme": {
+                            "primary": "#fff",
+                            "secondary": "#000",
+                            "glow": "rgba(0,0,0,0.2)",
+                        },
+                    }
+                ],
+                "banner_versions": [
+                    {
+                        "id": active_version_id,
+                        "banner_id": "banner",
+                        "rule_set_id": None,
+                        "version": 1,
+                        "status": "published",
+                        "effective_from": "2026-07-01T00:00:00+00:00",
+                        "effective_to": "2026-08-01T00:00:00+00:00",
+                    },
+                    {
+                        "id": future_version_id,
+                        "banner_id": "banner",
+                        "rule_set_id": None,
+                        "version": 2,
+                        "status": "published",
+                        "effective_from": "2026-09-01T00:00:00+00:00",
+                        "effective_to": None,
+                    },
+                ],
+                "banner_items": [
+                    {
+                        "banner_version_id": active_version_id,
+                        "item_id": "five",
+                        "featured_group": None,
+                        "sort_order": 1,
+                    },
+                    {
+                        "banner_version_id": active_version_id,
+                        "item_id": "four",
+                        "featured_group": None,
+                        "sort_order": 2,
+                    },
+                ],
+                "rarity_rates": [
+                    {
+                        "banner_version_id": active_version_id,
+                        "rarity": 5,
+                        "base_rate_ppm": 10000,
+                        "roll_order": 1,
+                    },
+                    {
+                        "banner_version_id": active_version_id,
+                        "rarity": 4,
+                        "base_rate_ppm": 90000,
+                        "roll_order": 2,
+                    },
+                ],
+                "featured_rules": [],
+                "pity_rules": [
+                    {
+                        "banner_version_id": active_version_id,
+                        "rarity": 5,
+                        "counter_key": "five_star",
+                        "hard_pity": 80,
+                        "soft_pity_start": None,
+                        "soft_pity_increment_ppm": 0,
+                        "resets_lower_rarity": True,
+                    },
+                    {
+                        "banner_version_id": active_version_id,
+                        "rarity": 4,
+                        "counter_key": "four_star",
+                        "hard_pity": 10,
+                        "soft_pity_start": None,
+                        "soft_pity_increment_ppm": 0,
+                        "resets_lower_rarity": False,
+                    },
+                ],
+                "rule_sets": [],
+                "rule_set_rarity_rates": [],
+                "rule_set_featured_rules": [],
+                "rule_set_pity_rules": [],
+            },
+        }
+
+        snapshot = _build_snapshot_from_release(
+            release_row,
+            expected_project_id=project_id,
+            expected_environment_id=environment_id,
+            now=datetime(2026, 7, 22, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual([banner.id for banner in snapshot.banners], ["banner"])
+        self.assertEqual(snapshot.banner_configs_by_id["banner"].version, 1)
+        self.assertEqual(
+            snapshot.banner_configs_by_id["banner"].banner_version_id,
+            active_version_id,
+        )
+
+    def test_build_snapshot_from_release_rejects_invalid_checksum(self) -> None:
+        with self.assertRaisesRegex(CatalogLoadError, "checksum"):
+            _build_snapshot_from_release(
+                {"checksum_valid": False, "snapshot": {}},
+                expected_project_id="project",
+                expected_environment_id="environment",
+            )
+
     def test_build_snapshot_allows_empty_catalog(self) -> None:
         snapshot = _build_snapshot(
             item_rows=[],
@@ -276,6 +443,47 @@ class CatalogRepositoryTests(unittest.TestCase):
 
 
 class PostgresCatalogRepositoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_load_snapshot_reads_current_release_for_explicit_context(self) -> None:
+        project_id = "b2000000-b2b2-4b2b-8b2b-b2b2b2b2b2b2"
+        environment_id = "c3000000-c3c3-4c3c-8c3c-c3c3c3c3c3c3"
+        connection = FakeConnection(
+            fetchrow_result={
+                "release_id": "d4000000-d4d4-4d4d-8d4d-d4d4d4d4d4d4",
+                "checksum_valid": True,
+                "snapshot": {
+                    "schema_version": 1,
+                    "project_id": project_id,
+                    "environment_id": environment_id,
+                    "items": [],
+                    "banners": [],
+                    "banner_versions": [],
+                    "banner_items": [],
+                    "rarity_rates": [],
+                    "featured_rules": [],
+                    "pity_rules": [],
+                    "rule_sets": [],
+                    "rule_set_rarity_rates": [],
+                    "rule_set_featured_rules": [],
+                    "rule_set_pity_rules": [],
+                },
+            }
+        )
+        repository = PostgresCatalogRepository(
+            database_url="postgres://example",
+            project_id=project_id,
+            environment_id=environment_id,
+            pool_size=1,
+            query_timeout_seconds=1,
+        )
+        repository._pool = FakePool(connection)
+
+        snapshot = await repository.load_snapshot()
+
+        self.assertEqual(snapshot.items, ())
+        self.assertEqual(snapshot.banner_configs_by_id, {})
+        self.assertEqual(len(connection.fetchrow_calls), 1)
+        self.assertEqual(connection.fetchrow_calls[0][1:], (project_id, environment_id))
+
     async def test_load_snapshot_allows_empty_current_catalog(self) -> None:
         connection = FakeConnection(
             [
@@ -292,6 +500,8 @@ class PostgresCatalogRepositoryTests(unittest.IsolatedAsyncioTestCase):
         )
         repository = PostgresCatalogRepository(
             database_url="postgres://example",
+            project_id="b2000000-b2b2-4b2b-8b2b-b2b2b2b2b2b2",
+            environment_id="c3000000-c3c3-4c3c-8c3c-c3c3c3c3c3c3",
             pool_size=1,
             query_timeout_seconds=1,
         )

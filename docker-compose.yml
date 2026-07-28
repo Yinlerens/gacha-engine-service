@@ -1,16 +1,21 @@
 services:
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: gacha
+      POSTGRES_USER: gacha
+      POSTGRES_PASSWORD: gacha
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:5434:5432"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "pg_isready -U gacha -d gacha"]
       interval: 5s
       timeout: 3s
       retries: 10
     volumes:
-      - gacha_redis:/data
+      - gacha_postgres:/var/lib/postgresql/data
+      - ./migrations/000001_gacha_runtime_state.up.sql:/docker-entrypoint-initdb.d/000001_gacha_runtime_state.sql:ro
+      - ./migrations/000002_pull_processing_lease.up.sql:/docker-entrypoint-initdb.d/000002_pull_processing_lease.sql:ro
 
   kafka:
     image: redpandadata/redpanda:v24.3.7
@@ -45,14 +50,14 @@ services:
     build:
       context: .
     depends_on:
-      redis:
+      db:
         condition: service_healthy
       kafka:
         condition: service_healthy
     environment:
       PORT: "8080"
       INTERNAL_TOKEN: local-dev-token
-      REDIS_URL: redis://redis:6379/0
+      GACHA_STATE_DATABASE_URL: postgresql://gacha:gacha@db:5432/gacha
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: gacha.pull_completed.v1
       KAFKA_CLIENT_ID: gacha-engine-service
@@ -60,4 +65,4 @@ services:
       - "127.0.0.1:8082:8080"
 
 volumes:
-  gacha_redis:
+  gacha_postgres:

@@ -108,6 +108,18 @@ class PullResponse(BaseModel):
     state_version: int
 
 
+class PullOperationStateResponse(BaseModel):
+    status: Literal[
+        "processing",
+        "event_pending",
+        "succeeded",
+        "refund_pending",
+        "failed",
+    ]
+    response: PullResponse | None = None
+    error: ApiError | None = None
+
+
 class PullCompletedEvent(BaseModel):
     event_id: str
     event_type: Literal["gacha.pull_completed.v1"] = "gacha.pull_completed.v1"

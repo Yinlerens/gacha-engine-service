@@ -11,6 +11,8 @@ from gacha_engine_service.asset_client import AssetServiceError
 from gacha_engine_service.catalog_config import CatalogSnapshot
 from gacha_engine_service.config import Settings
 from gacha_engine_service.main import AppServices, create_app, recover_pending_pull_events_once
+from gacha_engine_service.postgres_state import PostgresGachaStateStore
+from gacha_engine_service.pull_operations import PullOperation
 from gacha_engine_service.schemas import PitySnapshot
 
 from .fakes import FakeAssetClient, FakeEventPublisher, FakePityStateStore
@@ -88,7 +90,22 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["status"], "not_ready")
-        self.assertEqual(response.json()["checks"], {"redis": "unavailable", "kafka": "unavailable"})
+        self.assertEqual(
+            response.json()["checks"],
+            {"state_database": "unavailable", "kafka": "unavailable"},
+        )
+
+    def test_default_state_store_is_postgres_authoritative(self) -> None:
+        app = create_app(
+            settings=Settings(
+                internal_token="test-token",
+                gacha_state_database_url="postgresql://state",
+            ),
+            event_publisher=FakeEventPublisher(),
+            asset_client=FakeAssetClient(),
+        )
+
+        self.assertIsInstance(app.state.services.state_store, PostgresGachaStateStore)
 
     def test_ready_reports_missing_internal_token(self) -> None:
         app = create_app(
@@ -167,6 +184,144 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "missing_idempotency_key")
 
+    def test_get_pull_operation_requires_gateway_authentication(self) -> None:
+        client, _, _, _ = make_client()
+
+        response = client.get(
+            "/v1/me/pulls/operation",
+            headers={
+                "X-User-Id": USER_ID,
+                "Idempotency-Key": HEADERS["Idempotency-Key"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_get_pull_operation_returns_only_safe_current_user_state(self) -> None:
+        client, state_store, _, _ = make_client()
+        pull_response = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1, "seed": "query-state"},
+            headers=HEADERS,
+        )
+
+        response = client.get("/v1/me/pulls/operation", headers=HEADERS)
+
+        self.assertEqual(pull_response.status_code, 200)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "succeeded",
+                "response": pull_response.json(),
+                "error": None,
+            },
+        )
+        self.assertEqual(set(response.json()), {"status", "response", "error"})
+        serialized = response.text
+        self.assertNotIn("request_hash", serialized)
+        self.assertNotIn(USER_ID, serialized)
+        self.assertIn((UUID(USER_ID), HEADERS["Idempotency-Key"]), state_store.operations)
+
+    def test_get_pull_operation_does_not_cross_user_boundaries(self) -> None:
+        client, _, _, _ = make_client()
+        created = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1},
+            headers=HEADERS,
+        )
+        other_user_headers = {
+            **HEADERS,
+            "X-User-Id": "b6cc17d1-4e6e-4691-9ed7-d5893ab2dd2d",
+        }
+
+        response = client.get(
+            f"/v1/me/pulls/operation?user_id={USER_ID}",
+            headers=other_user_headers,
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["code"], "pull_operation_not_found")
+
+    def test_get_pull_operation_projects_processing_event_pending_and_failed_states(self) -> None:
+        client, state_store, _, _ = make_client()
+        created = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1},
+            headers=HEADERS,
+        )
+        self.assertEqual(created.status_code, 200)
+        operation_key = (UUID(USER_ID), HEADERS["Idempotency-Key"])
+        completed_operation = state_store.operations[operation_key]
+
+        cases = [
+            (
+                PullOperation(status="processing", request_hash="private-processing-hash"),
+                {"status": "processing", "response": None, "error": None},
+            ),
+            (
+                completed_operation.model_copy(update={"status": "event_pending"}),
+                {"status": "event_pending", "response": created.json(), "error": None},
+            ),
+            (
+                PullOperation(
+                    status="refund_pending",
+                    request_hash="private-refund-hash",
+                    error_code="pity_version_conflict",
+                    error_message="refund is pending",
+                ),
+                {
+                    "status": "refund_pending",
+                    "response": None,
+                    "error": {"code": "pity_version_conflict", "message": "refund is pending"},
+                },
+            ),
+            (
+                PullOperation(
+                    status="failed",
+                    request_hash="private-failed-hash",
+                    error_code="insufficient_assets",
+                    error_message="balance is insufficient",
+                ),
+                {
+                    "status": "failed",
+                    "response": None,
+                    "error": {"code": "insufficient_assets", "message": "balance is insufficient"},
+                },
+            ),
+        ]
+
+        for operation, expected in cases:
+            with self.subTest(status=operation.status):
+                state_store.operations[operation_key] = operation
+                response = client.get("/v1/me/pulls/operation", headers=HEADERS)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), expected)
+                self.assertEqual(set(response.json()), {"status", "response", "error"})
+                self.assertNotIn("request_hash", response.text)
+
+    def test_get_pull_operation_returns_not_found_without_starting_a_pull(self) -> None:
+        client, state_store, event_publisher, asset_client = make_client()
+
+        response = client.get("/v1/me/pulls/operation", headers=HEADERS)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["code"], "pull_operation_not_found")
+        self.assertEqual(state_store.snapshot.version, 0)
+        self.assertEqual(asset_client.spends, [])
+        self.assertEqual(event_publisher.events, [])
+
+    def test_get_pull_operation_reports_state_database_failure_as_unknown(self) -> None:
+        client, _, _, _ = make_client(state_store=FakePityStateStore(unavailable=True))
+
+        response = client.get("/v1/me/pulls/operation", headers=HEADERS)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "state_store_unavailable")
+
     def test_pull_rejects_unknown_banner(self) -> None:
         client, _, _, _ = make_client()
 
@@ -243,6 +398,31 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.spends), 1)
         self.assertEqual(len(event_publisher.events), 1)
 
+    def test_timed_out_client_can_recover_completed_pull_without_a_second_charge(self) -> None:
+        client, state_store, event_publisher, asset_client = make_client()
+
+        completed_but_unseen = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 10},
+            headers=HEADERS,
+        )
+        operation = client.get("/v1/me/pulls/operation", headers=HEADERS)
+        recovered = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 10},
+            headers=HEADERS,
+        )
+
+        self.assertEqual(completed_but_unseen.status_code, 200)
+        self.assertEqual(operation.status_code, 200)
+        self.assertEqual(operation.json()["status"], "succeeded")
+        self.assertEqual(operation.json()["response"], completed_but_unseen.json())
+        self.assertEqual(recovered.json(), completed_but_unseen.json())
+        self.assertEqual(state_store.snapshot.version, 1)
+        self.assertEqual(len(asset_client.spends), 1)
+        self.assertEqual(asset_client.spends[0]["amount_minor"], 1_600)
+        self.assertEqual(len(event_publisher.events), 1)
+
     def test_pull_rejects_idempotency_key_reuse_with_different_request(self) -> None:
         client, state_store, event_publisher, asset_client = make_client()
 
@@ -284,7 +464,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.credits), 0)
         self.assertEqual(len(event_publisher.events), 0)
 
-    def test_pull_returns_conflict_when_redis_version_changes(self) -> None:
+    def test_pull_returns_conflict_when_pity_version_changes(self) -> None:
         client, _, _, asset_client = make_client(state_store=FakePityStateStore(conflict=True))
 
         response = client.post(
@@ -299,7 +479,147 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.credits), 1)
         self.assertEqual(asset_client.credits[0]["reason"], "gacha_pull_refund")
 
-    def test_pull_returns_unavailable_when_redis_fails(self) -> None:
+    def test_refund_is_persisted_before_asset_credit(self) -> None:
+        state_store = FakePityStateStore(conflict=True)
+        status_during_credit: list[str] = []
+        operation_key = (UUID(USER_ID), HEADERS["Idempotency-Key"])
+        asset_client = FakeAssetClient(
+            before_credit=lambda: status_during_credit.append(
+                state_store.operations[operation_key].status
+            )
+        )
+        client, _, _, _ = make_client(
+            state_store=state_store,
+            asset_client=asset_client,
+        )
+
+        response = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1, "seed": "conflict"},
+            headers=HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(status_during_credit, ["refund_pending"])
+
+    def test_uncertain_state_commit_never_triggers_a_refund(self) -> None:
+        state_store = FakePityStateStore(commit_unavailable=True)
+        client, state_store, _, asset_client = make_client(state_store=state_store)
+
+        response = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 10, "seed": "unknown-commit"},
+            headers=HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "state_store_unavailable")
+        self.assertEqual(len(asset_client.spends), 1)
+        self.assertEqual(asset_client.credits, [])
+        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        self.assertEqual(operation.status, "processing")
+
+    def test_lost_commit_ack_reconciles_the_committed_result(self) -> None:
+        state_store = FakePityStateStore(commit_ack_lost=True)
+        client, state_store, event_publisher, asset_client = make_client(
+            state_store=state_store,
+        )
+
+        response = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 10, "seed": "lost-ack"},
+            headers=HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(state_store.snapshot.version, 1)
+        self.assertEqual(len(asset_client.spends), 1)
+        self.assertEqual(asset_client.credits, [])
+        self.assertEqual(len(event_publisher.events), 1)
+        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        self.assertEqual(operation.status, "succeeded")
+
+    def test_expired_processing_pull_resumes_without_a_second_charge(self) -> None:
+        state_store = FakePityStateStore(commit_unavailable=True)
+        client, state_store, event_publisher, asset_client = make_client(
+            state_store=state_store,
+        )
+
+        first = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 10, "seed": "resume"},
+            headers=HEADERS,
+        )
+        state_store.commit_unavailable = False
+        state_store.expire_processing_lease(
+            user_id=UUID(USER_ID),
+            idempotency_key=HEADERS["Idempotency-Key"],
+        )
+        second = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 10, "seed": "resume"},
+            headers=HEADERS,
+        )
+
+        self.assertEqual(first.status_code, 503)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(state_store.snapshot.version, 1)
+        self.assertEqual(len(asset_client.spends), 1)
+        self.assertEqual(asset_client.credits, [])
+        self.assertEqual(len(event_publisher.events), 1)
+
+    def test_transient_asset_failure_keeps_pull_available_for_safe_resume(self) -> None:
+        state_store = FakePityStateStore()
+        asset_client = FakeAssetClient(
+            spend_error=AssetServiceError(503, "asset_unavailable", "asset service timed out")
+        )
+        client, state_store, event_publisher, asset_client = make_client(
+            state_store=state_store,
+            asset_client=asset_client,
+        )
+
+        first = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1, "seed": "asset-resume"},
+            headers=HEADERS,
+        )
+        asset_client.spend_error = None
+        state_store.expire_processing_lease(
+            user_id=UUID(USER_ID),
+            idempotency_key=HEADERS["Idempotency-Key"],
+        )
+        second = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1, "seed": "asset-resume"},
+            headers=HEADERS,
+        )
+
+        self.assertEqual(first.status_code, 503)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(asset_client.spends), 1)
+        self.assertEqual(asset_client.credits, [])
+        self.assertEqual(len(event_publisher.events), 1)
+
+    def test_stale_processing_owner_cannot_refund_or_commit(self) -> None:
+        state_store = FakePityStateStore(ownership_lost_on_commit=True)
+        client, state_store, event_publisher, asset_client = make_client(
+            state_store=state_store,
+        )
+
+        response = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1, "seed": "stale-owner"},
+            headers=HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "pull_in_progress")
+        self.assertEqual(state_store.snapshot.version, 0)
+        self.assertEqual(len(asset_client.spends), 1)
+        self.assertEqual(asset_client.credits, [])
+        self.assertEqual(event_publisher.events, [])
+
+    def test_pull_fails_closed_when_state_database_is_unavailable(self) -> None:
         client, _, _, asset_client = make_client(state_store=FakePityStateStore(unavailable=True))
 
         response = client.post(
@@ -309,9 +629,9 @@ class ApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["error"]["code"], "redis_unavailable")
-        self.assertEqual(len(asset_client.spends), 1)
-        self.assertEqual(len(asset_client.credits), 1)
+        self.assertEqual(response.json()["error"]["code"], "state_store_unavailable")
+        self.assertEqual(len(asset_client.spends), 0)
+        self.assertEqual(len(asset_client.credits), 0)
 
     def test_pull_returns_unavailable_when_kafka_publish_fails(self) -> None:
         client, state_store, _, asset_client = make_client(event_publisher=FakeEventPublisher(publish_error=True))

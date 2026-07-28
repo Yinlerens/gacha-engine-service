@@ -68,10 +68,14 @@ class PostgresCatalogRepository:
         self,
         *,
         database_url: str,
+        project_id: str,
+        environment_id: str,
         pool_size: int,
         query_timeout_seconds: int,
     ) -> None:
         self._database_url = database_url
+        self._project_id = project_id
+        self._environment_id = environment_id
         self._pool_size = max(1, pool_size)
         self._query_timeout_seconds = max(1, query_timeout_seconds)
         self._pool: Any | None = None
@@ -85,50 +89,10 @@ class PostgresCatalogRepository:
         pool = await self._ensure_pool()
         try:
             async with pool.acquire() as connection:
-                items_rows = await connection.fetch(ITEMS_SQL, timeout=self._query_timeout_seconds)
-                banner_rows = await connection.fetch(BANNERS_SQL, timeout=self._query_timeout_seconds)
-
-                version_ids = [str(row["banner_version_id"]) for row in banner_rows]
-                banner_item_rows = await connection.fetch(
-                    BANNER_ITEMS_SQL,
-                    version_ids,
-                    timeout=self._query_timeout_seconds,
-                )
-                rule_set_ids = sorted(
-                    {
-                        str(row["rule_set_id"])
-                        for row in banner_rows
-                        if row["rule_set_id"] is not None
-                    }
-                )
-                rarity_rows = await connection.fetch(
-                    RARITY_RATES_SQL,
-                    version_ids,
-                    timeout=self._query_timeout_seconds,
-                )
-                featured_rows = await connection.fetch(
-                    FEATURED_RULES_SQL,
-                    version_ids,
-                    timeout=self._query_timeout_seconds,
-                )
-                rule_set_rarity_rows = await connection.fetch(
-                    RULE_SET_RARITY_RATES_SQL,
-                    rule_set_ids,
-                    timeout=self._query_timeout_seconds,
-                )
-                rule_set_featured_rows = await connection.fetch(
-                    RULE_SET_FEATURED_RULES_SQL,
-                    rule_set_ids,
-                    timeout=self._query_timeout_seconds,
-                )
-                rule_set_pity_rows = await connection.fetch(
-                    RULE_SET_PITY_RULES_SQL,
-                    rule_set_ids,
-                    timeout=self._query_timeout_seconds,
-                )
-                pity_rows = await connection.fetch(
-                    PITY_RULES_SQL,
-                    version_ids,
+                release_row = await connection.fetchrow(
+                    CURRENT_RELEASE_SQL,
+                    self._project_id,
+                    self._environment_id,
                     timeout=self._query_timeout_seconds,
                 )
         except CatalogLoadError:
@@ -136,16 +100,10 @@ class PostgresCatalogRepository:
         except Exception as exc:
             raise CatalogLoadError("load gacha catalog from postgres failed") from exc
 
-        return _build_snapshot(
-            item_rows=items_rows,
-            banner_rows=banner_rows,
-            banner_item_rows=banner_item_rows,
-            rarity_rows=rarity_rows,
-            featured_rows=featured_rows,
-            pity_rows=pity_rows,
-            rule_set_rarity_rows=rule_set_rarity_rows,
-            rule_set_featured_rows=rule_set_featured_rows,
-            rule_set_pity_rows=rule_set_pity_rows,
+        return _build_snapshot_from_release(
+            release_row,
+            expected_project_id=self._project_id,
+            expected_environment_id=self._environment_id,
         )
 
     async def _ensure_pool(self) -> Any:
@@ -170,6 +128,126 @@ class PostgresCatalogRepository:
             raise CatalogLoadError("connect to gacha config database failed") from exc
 
         return self._pool
+
+
+def _build_snapshot_from_release(
+    release_row: Any | None,
+    *,
+    expected_project_id: str,
+    expected_environment_id: str,
+    now: datetime | None = None,
+) -> CatalogSnapshot:
+    if release_row is None:
+        return _build_snapshot(
+            item_rows=[],
+            banner_rows=[],
+            banner_item_rows=[],
+            rarity_rows=[],
+            featured_rows=[],
+            pity_rows=[],
+        )
+
+    if not bool(release_row["checksum_valid"]):
+        raise CatalogLoadError("current gacha release checksum is invalid")
+
+    payload = _json_object(release_row["snapshot"])
+    if payload.get("schema_version") != 1:
+        raise CatalogLoadError("unsupported gacha release snapshot schema")
+    if str(payload.get("project_id", "")).lower() != expected_project_id.lower():
+        raise CatalogLoadError("gacha release project does not match configured project")
+    if str(payload.get("environment_id", "")).lower() != expected_environment_id.lower():
+        raise CatalogLoadError("gacha release environment does not match configured environment")
+
+    item_rows = _release_array(payload, "items")
+    banners_by_id = {
+        str(row["id"]): row
+        for row in _release_array(payload, "banners")
+    }
+    effective_at = now or datetime.now(timezone.utc)
+    active_version_ids: set[str] = set()
+    active_banner_ids: set[str] = set()
+    banner_rows: list[dict[str, Any]] = []
+
+    for version in _release_array(payload, "banner_versions"):
+        if not _version_is_effective(version, effective_at):
+            continue
+
+        version_id = str(version["id"])
+        banner_id = str(version["banner_id"])
+        banner = banners_by_id.get(banner_id)
+        if banner is None:
+            raise CatalogLoadError(f"release version {version_id} references missing banner {banner_id}")
+        if banner_id in active_banner_ids:
+            raise CatalogLoadError(f"release contains overlapping active versions for banner {banner_id}")
+
+        active_version_ids.add(version_id)
+        active_banner_ids.add(banner_id)
+        banner_rows.append(
+            {
+                "banner_version_id": version_id,
+                "banner_id": banner_id,
+                "rule_set_id": version.get("rule_set_id"),
+                "version": version["version"],
+                "name": banner["name"],
+                "short_name": banner["short_name"],
+                "banner_type": banner["banner_type"],
+                "description": banner["description"],
+                "theme": banner["theme"],
+            }
+        )
+
+    def active_version_rows(key: str) -> list[dict[str, Any]]:
+        return [
+            row
+            for row in _release_array(payload, key)
+            if str(row["banner_version_id"]) in active_version_ids
+        ]
+
+    return _build_snapshot(
+        item_rows=item_rows,
+        banner_rows=banner_rows,
+        banner_item_rows=active_version_rows("banner_items"),
+        rarity_rows=active_version_rows("rarity_rates"),
+        featured_rows=active_version_rows("featured_rules"),
+        pity_rows=active_version_rows("pity_rules"),
+        rule_set_rarity_rows=_release_array(payload, "rule_set_rarity_rates"),
+        rule_set_featured_rows=_release_array(payload, "rule_set_featured_rules"),
+        rule_set_pity_rows=_release_array(payload, "rule_set_pity_rules"),
+    )
+
+
+def _release_array(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = payload.get(key)
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise CatalogLoadError(f"release snapshot field {key} must be an array of objects")
+    return value
+
+
+def _version_is_effective(version: dict[str, Any], now: datetime) -> bool:
+    effective_from = _release_timestamp(version.get("effective_from"), "effective_from")
+    raw_effective_to = version.get("effective_to")
+    effective_to = (
+        _release_timestamp(raw_effective_to, "effective_to")
+        if raw_effective_to is not None
+        else None
+    )
+    return effective_from <= now and (effective_to is None or now < effective_to)
+
+
+def _release_timestamp(value: Any, field_name: str) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise CatalogLoadError(f"release {field_name} is not a valid timestamp") from exc
+    else:
+        raise CatalogLoadError(f"release {field_name} is not a valid timestamp")
+
+    if parsed.tzinfo is None:
+        raise CatalogLoadError(f"release {field_name} must include a timezone")
+    return parsed
 
 
 def _build_snapshot(
@@ -407,102 +485,19 @@ def _json_object(value: Any) -> dict[str, Any]:
     raise CatalogLoadError("expected JSON object from catalog query")
 
 
-ITEMS_SQL = """
-select id, name, subtitle, rarity, item_type, element, role, faction, accent, quote
-from gacha.items
-where is_enabled
-order by rarity desc, item_type, id
-"""
-
-BANNERS_SQL = """
+CURRENT_RELEASE_SQL = """
 select
-  bv.id::text as banner_version_id,
-  bv.banner_id,
-  bv.rule_set_id,
-  bv.version,
-  b.name,
-  b.short_name,
-  b.banner_type,
-  b.description,
-  b.theme
-from gacha.banner_versions bv
-join gacha.banners b on b.id = bv.banner_id
-where b.is_enabled
-  and bv.status = 'published'
-  and now() >= bv.effective_from
-  and (bv.effective_to is null or now() < bv.effective_to)
-order by b.sort_order, b.id
-"""
-
-BANNER_ITEMS_SQL = """
-select banner_version_id::text as banner_version_id, item_id, pool_group, featured_group, weight, sort_order
-from gacha.banner_items
-where banner_version_id::text = any($1::text[])
-order by banner_version_id, sort_order, item_id
-"""
-
-RARITY_RATES_SQL = """
-select banner_version_id::text as banner_version_id, rarity, base_rate_ppm, roll_order
-from gacha.rarity_rates
-where banner_version_id::text = any($1::text[])
-order by banner_version_id, roll_order
-"""
-
-FEATURED_RULES_SQL = """
-select
-  banner_version_id::text as banner_version_id,
-  rarity,
-  featured_group,
-  featured_rate_ppm,
-  guarantee_after_miss,
-  miss_sets_guarantee,
-  guarantee_state_key
-from gacha.featured_rules
-where banner_version_id::text = any($1::text[])
-"""
-
-PITY_RULES_SQL = """
-select
-  banner_version_id::text as banner_version_id,
-  rarity,
-  counter_key,
-  hard_pity,
-  soft_pity_start,
-  soft_pity_increment_ppm,
-  resets_lower_rarity
-from gacha.pity_rules
-where banner_version_id::text = any($1::text[])
-"""
-
-RULE_SET_RARITY_RATES_SQL = """
-select rule_set_id, rarity, base_rate_ppm, roll_order
-from gacha.rule_set_rarity_rates
-where rule_set_id = any($1::text[])
-order by rule_set_id, roll_order
-"""
-
-RULE_SET_FEATURED_RULES_SQL = """
-select
-  rule_set_id,
-  rarity,
-  featured_group,
-  featured_rate_ppm,
-  guarantee_after_miss,
-  miss_sets_guarantee,
-  guarantee_state_key
-from gacha.rule_set_featured_rules
-where rule_set_id = any($1::text[])
-"""
-
-RULE_SET_PITY_RULES_SQL = """
-select
-  rule_set_id,
-  rarity,
-  counter_key,
-  hard_pity,
-  soft_pity_start,
-  soft_pity_increment_ppm,
-  resets_lower_rarity
-from gacha.rule_set_pity_rules
-where rule_set_id = any($1::text[])
+  release.id::text as release_id,
+  release.snapshot,
+  release.snapshot_sha256 = encode(
+    extensions.digest(release.snapshot::text, 'sha256'),
+    'hex'
+  ) as checksum_valid
+from gacha.environment_release_heads head
+join gacha.releases release
+  on release.id = head.release_id
+ and release.project_id = head.project_id
+ and release.environment_id = head.environment_id
+where head.project_id = $1::uuid
+  and head.environment_id = $2::uuid
 """

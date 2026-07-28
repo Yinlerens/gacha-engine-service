@@ -152,11 +152,13 @@ dependencies = [
     { name = "asyncpg" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "redis" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.optional-dependencies]
+legacy-migration = [
+    { name = "redis" },
+]
 test = [
     { name = "pytest" },
 ]
@@ -168,10 +170,10 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0,<1.0.0" },
     { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.3.0,<9.0.0" },
-    { name = "redis", specifier = ">=5.2.0,<7.0.0" },
+    { name = "redis", marker = "extra == 'legacy-migration'", specifier = ">=5.2.0,<7.0.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0,<1.0.0" },
 ]
-provides-extras = ["test"]
+provides-extras = ["legacy-migration", "test"]
 
 [[package]]
 name = "h11"

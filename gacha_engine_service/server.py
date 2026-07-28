@@ -8,7 +8,7 @@ from .config import Settings
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="启动无数据库 Python 抽卡引擎服务。")
+    parser = argparse.ArgumentParser(description="启动持久化 Python 抽卡引擎服务。")
     parser.add_argument("--host", default=None, help="服务监听地址，例如 127.0.0.1 或 0.0.0.0。")
     parser.add_argument("--port", default=None, type=int, help="服务监听端口，例如 8080。")
     return parser
@@ -29,4 +29,3 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     run(host=args.host, port=args.port)
-

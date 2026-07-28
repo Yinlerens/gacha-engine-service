@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gacha-engine-service"
 dynamic = ["version"]
-description = "A stateless FastAPI gacha engine that stores pity snapshots in Redis and publishes pull events to Kafka."
+description = "A FastAPI gacha engine with durable Postgres idempotency, pity state, and Kafka event recovery."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -13,11 +13,13 @@ dependencies = [
     "asyncpg>=0.30.0,<1.0.0",
     "fastapi>=0.115.0,<1.0.0",
     "httpx>=0.28.0,<1.0.0",
-    "redis>=5.2.0,<7.0.0",
     "uvicorn[standard]>=0.32.0,<1.0.0",
 ]
 
 [project.optional-dependencies]
+legacy-migration = [
+    "redis>=5.2.0,<7.0.0",
+]
 test = [
     "pytest>=8.3.0,<9.0.0",
 ]

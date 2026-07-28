@@ -1,9 +1,10 @@
-"""Redis-serializable pull operation state."""
+"""Durable pull operation state and processing claims."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -26,6 +27,16 @@ class PullOperation(BaseModel):
     event: PullCompletedEvent | None = None
     error_code: str | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class PullOperationClaim:
+    operation: PullOperation
+    processing_token: UUID | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self.processing_token is not None
 
 
 @dataclass(frozen=True)

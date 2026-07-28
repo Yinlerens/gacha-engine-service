@@ -26,16 +26,23 @@ from .catalog_repository import (
 from .config import Settings
 from .engine import perform_pulls
 from .kafka_events import EventPublishError, KafkaEventPublisher
+from .postgres_state import PostgresGachaStateStore
 from .pull_operations import PullOperation
-from .redis_state import PityStateStoreError, PityVersionConflict, RedisPityStateStore
 from .schemas import (
+    ApiError,
     ErrorResponse,
     HealthResponse,
     PitySnapshot,
     PullCompletedEvent,
+    PullOperationStateResponse,
     PullRequest,
     PullResponse,
     ReadyResponse,
+)
+from .state_store import (
+    GachaStateStoreError,
+    PityVersionConflict,
+    PullOperationOwnershipLost,
 )
 
 
@@ -44,6 +51,7 @@ ASTRITE_PER_PULL = 160
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 REQUEST_ID_HEADER = "X-Request-Id"
 MAX_IDEMPOTENCY_KEY_LENGTH = 128
+PULL_PROCESSING_LEASE_SECONDS = 30
 PULL_EVENT_NAMESPACE = uuid.UUID("d19f2db2-5d10-4dbf-95ee-2680ab82d908")
 
 
@@ -79,10 +87,10 @@ def create_app(
     owns_asset_client = asset_client is None
 
     if state_store is None:
-        state_store = RedisPityStateStore(
-            redis_url=settings.redis_url,
-            key_prefix=settings.redis_key_prefix,
-            pull_operation_ttl_seconds=settings.pull_operation_ttl_seconds,
+        state_store = PostgresGachaStateStore(
+            database_url=settings.gacha_state_database_url,
+            pool_size=settings.gacha_state_pool_size,
+            query_timeout_seconds=settings.gacha_state_query_timeout_seconds,
         )
 
     if event_publisher is None:
@@ -142,7 +150,7 @@ def create_app(
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
-        description="无数据库抽卡引擎：Redis 保存保底快照，Kafka 发布抽卡完成事件。",
+        description="Postgres 持久化抽卡与保底状态，Kafka 发布已提交的抽卡事件。",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -215,7 +223,7 @@ def register_routes(app: FastAPI) -> None:
         try:
             await services.state_store.ping()
         except Exception:
-            checks["redis"] = "unavailable"
+            checks["state_database"] = "unavailable"
 
         try:
             await services.event_publisher.ping()
@@ -266,11 +274,65 @@ def register_routes(app: FastAPI) -> None:
         services: AppServices = request.app.state.services
         try:
             return await services.state_store.get_snapshot(user_id, banner_id)
-        except PityStateStoreError as exc:
+        except GachaStateStoreError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "redis_unavailable", "message": "pity state is unavailable"},
+                detail={
+                    "code": "state_store_unavailable",
+                    "message": "pity state is unavailable",
+                },
             ) from exc
+
+    @app.get(
+        "/v1/me/pulls/operation",
+        response_model=PullOperationStateResponse,
+        tags=["gacha"],
+    )
+    async def get_pull_operation(
+        request: Request,
+        user_id: UUID = Depends(current_user_id),
+        idempotency_key: str = Depends(idempotency_key_header),
+    ) -> PullOperationStateResponse:
+        services: AppServices = request.app.state.services
+        try:
+            operation = await services.state_store.get_pull_operation(
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+            )
+        except GachaStateStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "state_store_unavailable",
+                    "message": "pull operation state is unavailable",
+                },
+            ) from exc
+
+        if operation is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "pull_operation_not_found",
+                    "message": "pull operation was not found",
+                },
+            )
+
+        operation_error = None
+        if operation.error_code or operation.error_message:
+            operation_error = ApiError(
+                code=operation.error_code or "pull_failed",
+                message=operation.error_message or "pull operation failed",
+            )
+
+        return PullOperationStateResponse(
+            status=operation.status,
+            response=(
+                operation.response
+                if operation.status in {"event_pending", "succeeded"}
+                else None
+            ),
+            error=operation_error,
+        )
 
     @app.post("/v1/me/pulls", response_model=PullResponse, tags=["gacha"])
     async def create_pull(
@@ -300,20 +362,24 @@ def register_routes(app: FastAPI) -> None:
         event_id = deterministic_pull_event_id(user_id, idempotency_key)
 
         try:
-            existing_operation = await services.state_store.begin_pull_operation(
+            operation_claim = await services.state_store.begin_pull_operation(
                 user_id=user_id,
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
+                processing_lease_seconds=PULL_PROCESSING_LEASE_SECONDS,
             )
-        except PityStateStoreError as exc:
+        except GachaStateStoreError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "redis_unavailable", "message": "pull idempotency is unavailable"},
+                detail={
+                    "code": "state_store_unavailable",
+                    "message": "pull idempotency is unavailable",
+                },
             ) from exc
 
-        if existing_operation is not None:
+        if not operation_claim.acquired:
             return await handle_existing_pull_operation(
-                operation=existing_operation,
+                operation=operation_claim.operation,
                 services=services,
                 user_id=user_id,
                 idempotency_key=idempotency_key,
@@ -328,6 +394,10 @@ def register_routes(app: FastAPI) -> None:
                     count=pull_request.count,
                 ),
             )
+
+        processing_token = operation_claim.processing_token
+        if processing_token is None:
+            raise RuntimeError("acquired pull operation is missing its processing token")
 
         metadata = pull_asset_metadata(
             event_id=event_id,
@@ -352,14 +422,34 @@ def register_routes(app: FastAPI) -> None:
                 exc.status_code,
                 exc.code,
             )
-            await mark_pull_operation_failed(
-                services=services,
-                user_id=user_id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-                code=asset_error_code(exc),
-                message=asset_error_message(exc),
-            )
+            if exc.status_code >= 500:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "asset_unavailable",
+                        "message": "asset spend outcome is being reconciled",
+                    },
+                ) from exc
+
+            try:
+                await services.state_store.transition_pull_operation_from_processing(
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    processing_token=processing_token,
+                    operation=PullOperation(
+                        status="failed",
+                        request_hash=request_hash,
+                        error_code=asset_error_code(exc),
+                        error_message=asset_error_message(exc),
+                    ),
+                )
+            except PullOperationOwnershipLost as ownership_error:
+                raise pull_in_progress_http_exception() from ownership_error
+            except GachaStateStoreError as state_error:
+                raise state_store_http_exception(
+                    "pull failure could not be persisted"
+                ) from state_error
             raise asset_http_exception(exc) from exc
 
         try:
@@ -408,8 +498,33 @@ def register_routes(app: FastAPI) -> None:
                 expected_version=previous_pity.version,
                 next_pity=next_pity_state,
                 operation=pending_operation,
+                processing_token=processing_token,
             )
         except PityVersionConflict as exc:
+            try:
+                await services.state_store.transition_pull_operation_from_processing(
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    processing_token=processing_token,
+                    operation=PullOperation(
+                        status="refund_pending",
+                        request_hash=request_hash,
+                        response=response,
+                        event=event,
+                        error_code="pity_version_conflict",
+                        error_message=(
+                            f"pity state was updated at version {exc.current_version}"
+                        ),
+                    ),
+                )
+            except PullOperationOwnershipLost as ownership_error:
+                raise pull_in_progress_http_exception() from ownership_error
+            except GachaStateStoreError as state_error:
+                raise state_store_http_exception(
+                    "pull refund could not be scheduled"
+                ) from state_error
+
             await refund_spend(
                 services=services,
                 user_id=user_id,
@@ -429,22 +544,35 @@ def register_routes(app: FastAPI) -> None:
                     "message": f"pity state was updated at version {exc.current_version}",
                 },
             ) from exc
-        except PityStateStoreError as exc:
-            await refund_spend(
-                services=services,
-                user_id=user_id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-                event_id=event_id,
-                amount_minor=cost_minor,
-                metadata=metadata,
-                request_id=request_id,
-                code="redis_unavailable",
-                message="pity state is unavailable",
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "redis_unavailable", "message": "pity state is unavailable"},
+        except PullOperationOwnershipLost as exc:
+            raise pull_in_progress_http_exception() from exc
+        except GachaStateStoreError as exc:
+            try:
+                reconciled_operation = await services.state_store.get_pull_operation(
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                )
+            except GachaStateStoreError:
+                reconciled_operation = None
+
+            if (
+                reconciled_operation is not None
+                and reconciled_operation.status != "processing"
+            ):
+                return await handle_existing_pull_operation(
+                    operation=reconciled_operation,
+                    services=services,
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    event_id=event_id,
+                    amount_minor=cost_minor,
+                    request_id=request_id,
+                    metadata=metadata,
+                )
+
+            raise state_store_http_exception(
+                "pull outcome is being reconciled"
             ) from exc
 
         try:
@@ -477,8 +605,16 @@ def create_catalog_repository(settings: Settings) -> CatalogRepository:
     if not settings.gacha_config_database_url:
         return StaticCatalogRepository()
 
+    if not settings.gacha_project_id or not settings.gacha_environment_id:
+        raise ValueError(
+            "GACHA_PROJECT_ID and GACHA_ENVIRONMENT_ID are required when "
+            "GACHA_CONFIG_DATABASE_URL is configured"
+        )
+
     return PostgresCatalogRepository(
         database_url=settings.gacha_config_database_url,
+        project_id=settings.gacha_project_id,
+        environment_id=settings.gacha_environment_id,
         pool_size=settings.gacha_config_pool_size,
         query_timeout_seconds=settings.gacha_config_query_timeout_seconds,
     )
@@ -639,17 +775,6 @@ async def refund_spend(
             exc.status_code,
             exc.code,
         )
-        await save_pull_operation_best_effort(
-            services=services,
-            user_id=user_id,
-            idempotency_key=idempotency_key,
-            operation=PullOperation(
-                status="refund_pending",
-                request_hash=request_hash,
-                error_code=code,
-                error_message=message,
-            ),
-        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -703,7 +828,7 @@ async def save_pull_operation_best_effort(
             idempotency_key=idempotency_key,
             operation=operation,
         )
-    except PityStateStoreError:
+    except GachaStateStoreError:
         LOGGER.warning("failed to save pull operation status", exc_info=True)
 
 
@@ -742,7 +867,7 @@ async def recover_pending_pull_events_once(
         pending_operations = await services.state_store.iter_event_pending_pull_operations(
             limit=limit,
         )
-    except PityStateStoreError:
+    except GachaStateStoreError:
         LOGGER.warning("failed to scan pending pull operations", exc_info=True)
         return 0
 
@@ -762,7 +887,7 @@ async def recover_pending_pull_events_once(
                 operation_key=record.operation_key,
                 lock_ttl_seconds=lock_ttl_seconds,
             )
-        except PityStateStoreError:
+        except GachaStateStoreError:
             LOGGER.warning(
                 "failed to claim pending pull event recovery event_id=%s",
                 event_id,
@@ -791,7 +916,7 @@ async def recover_pending_pull_events_once(
                 event_id,
                 exc_info=True,
             )
-        except PityStateStoreError:
+        except GachaStateStoreError:
             LOGGER.warning(
                 "failed to mark recovered pull operation succeeded event_id=%s",
                 event_id,
@@ -804,7 +929,7 @@ async def recover_pending_pull_events_once(
                 await services.state_store.release_pull_operation_recovery(
                     operation_key=record.operation_key,
                 )
-            except PityStateStoreError:
+            except GachaStateStoreError:
                 LOGGER.warning(
                     "failed to release pending pull event recovery lock event_id=%s",
                     event_id,
@@ -853,6 +978,23 @@ def asset_http_exception(exc: AssetServiceError) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail={"code": asset_error_code(exc), "message": asset_error_message(exc)},
+    )
+
+
+def state_store_http_exception(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"code": "state_store_unavailable", "message": message},
+    )
+
+
+def pull_in_progress_http_exception() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "pull_in_progress",
+            "message": "pull is already being processed by another worker",
+        },
     )
 
 
