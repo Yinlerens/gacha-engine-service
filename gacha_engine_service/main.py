@@ -117,7 +117,7 @@ def create_app(
         recovery_task: asyncio.Task[None] | None = None
         if settings.pending_event_recovery_enabled:
             recovery_task = asyncio.create_task(
-                run_pending_event_recovery_worker(
+                run_pull_recovery_worker(
                     services=AppServices(
                         state_store,
                         event_publisher,
@@ -128,7 +128,7 @@ def create_app(
                     batch_size=settings.pending_event_recovery_batch_size,
                     lock_ttl_seconds=settings.pending_event_recovery_lock_ttl_seconds,
                 ),
-                name="pending-event-recovery",
+                name="pull-recovery",
             )
         try:
             yield
@@ -1035,7 +1035,7 @@ async def recover_expired_processing_pulls_once(
     return recovered_count
 
 
-async def run_pending_event_recovery_worker(
+async def run_pull_recovery_worker(
     *,
     services: AppServices,
     interval_seconds: int,
@@ -1063,7 +1063,7 @@ async def run_pending_event_recovery_worker(
         except asyncio.CancelledError:
             raise
         except Exception:
-            LOGGER.exception("pending pull event recovery worker failed")
+            LOGGER.exception("pull recovery worker failed")
             continue
 
         if recovered_processing_count:

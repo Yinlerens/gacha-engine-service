@@ -45,9 +45,10 @@ X-User-Id: <uuid>
 Idempotency-Key: <pull-operation-id>
 ```
 
-客户端在 `POST /v1/me/pulls` 超时或结果不确定时，必须保留原请求参数和
-`Idempotency-Key`，先调用 `GET /v1/me/pulls/operation` 查询当前用户的操作状态。
-只有明确返回 `pull_operation_not_found` 或 `failed` 后，才能丢弃旧键并允许新操作。
+客户端在 `POST /v1/me/pulls` 超时或结果不确定时，应保留原请求参数和
+`Idempotency-Key`，并用 `GET /v1/me/pulls/operation` 查询进度。服务端恢复不依赖
+客户端再次请求：后台 Worker 会接管租约过期的操作并继续执行。客户端在操作进入
+终态前不能用新键重复发起同一笔业务操作。
 
 ## 配置
 
@@ -75,6 +76,7 @@ GACHA_STATE_POOL_SIZE=8
 ```bash
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000001_gacha_runtime_state.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000002_pull_processing_lease.up.sql
+psql "$GACHA_STATE_DATABASE_URL" -f migrations/000003_pull_unattended_recovery.up.sql
 ```
 
 生产环境不能清理 `gacha_runtime.pull_operations` 中的幂等键；如需归档响应正文，也必须永久保留 `(user_id, idempotency_key_hash)` 墓碑。
@@ -125,7 +127,9 @@ docker compose up --build
 
 ## 说明
 
-Postgres 是抽卡操作、原始响应和保底快照的唯一事实源。幂等记录没有 TTL；缓存故障、切主或淘汰不会把已执行操作变成“未找到”。处理中请求使用短租约和 fencing token：进程中断后，同一请求可接管并用同一个资产幂等键继续，旧进程不能再提交或退款。数据库提交结果不明确时不会猜测退款，而是读取持久化操作状态后继续恢复。
+Postgres 是抽卡操作、原始响应和保底快照的唯一事实源。幂等记录没有 TTL；缓存故障、切主或淘汰不会把已执行操作变成“未找到”。扣款前会持久化完成本次抽卡所需的冻结配置、种子和事件 ID，但不保存明文 `Idempotency-Key`。处理中请求使用短租约和 fencing token：进程中断后，后台 Worker 会用同一个资产幂等键自动接管，旧进程不能再提交或退款。数据库提交结果不明确时不会猜测退款，而是读取持久化状态继续恢复。
+
+恢复 Worker 同时处理三类非终态：`processing` 自动续跑抽卡，`event_pending` 自动补发 Kafka，`refund_pending` 自动重试退款。扣款、退款和下游事件都使用稳定幂等标识；即使外部调用成功后进程再次中断，下一轮恢复也不会重复扣款或重复入账。操作进入 `succeeded` 或 `failed` 后会清除冻结恢复上下文，只永久保留幂等墓碑和必要的审计结果。
 
 `event_pending` 记录同时承担 Outbox 职责，Kafka 恢复任务会按数据库租约重复投递，背包服务再按 `event_id` 去重。
 
