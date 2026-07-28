@@ -10,7 +10,12 @@ from fastapi.testclient import TestClient
 from gacha_engine_service.asset_client import AssetServiceError
 from gacha_engine_service.catalog_config import CatalogSnapshot
 from gacha_engine_service.config import Settings
-from gacha_engine_service.main import AppServices, create_app, recover_pending_pull_events_once
+from gacha_engine_service.main import (
+    AppServices,
+    create_app,
+    recover_expired_processing_pulls_once,
+    recover_pending_pull_events_once,
+)
 from gacha_engine_service.postgres_state import PostgresGachaStateStore
 from gacha_engine_service.pull_operations import PullOperation
 from gacha_engine_service.schemas import PitySnapshot
@@ -567,6 +572,46 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.spends), 1)
         self.assertEqual(asset_client.credits, [])
         self.assertEqual(len(event_publisher.events), 1)
+
+    def test_expired_processing_pull_recovers_without_another_client_request(self) -> None:
+        state_store = FakePityStateStore(commit_unavailable=True)
+        client, state_store, event_publisher, asset_client = make_client(
+            state_store=state_store,
+        )
+
+        first = client.post(
+            "/v1/me/pulls",
+            json={
+                "banner_id": "limited-character-001",
+                "count": 10,
+                "seed": "unattended-recovery",
+            },
+            headers=HEADERS,
+        )
+        state_store.commit_unavailable = False
+        state_store.expire_processing_lease(
+            user_id=UUID(USER_ID),
+            idempotency_key=HEADERS["Idempotency-Key"],
+        )
+
+        recovered_count = asyncio.run(
+            recover_expired_processing_pulls_once(
+                AppServices(state_store, event_publisher, object(), asset_client),
+                limit=10,
+                processing_lease_seconds=30,
+            )
+        )
+
+        self.assertEqual(first.status_code, 503)
+        self.assertEqual(recovered_count, 1)
+        self.assertEqual(state_store.snapshot.version, 1)
+        self.assertEqual(len(asset_client.spends), 1)
+        self.assertEqual(asset_client.credits, [])
+        self.assertEqual(len(event_publisher.events), 1)
+        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        self.assertEqual(operation.status, "succeeded")
+        self.assertIsNotNone(operation.response)
+        self.assertIsNone(operation.recovery_context)
 
     def test_transient_asset_failure_keeps_pull_available_for_safe_resume(self) -> None:
         state_store = FakePityStateStore()

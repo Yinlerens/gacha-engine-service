@@ -4,8 +4,13 @@ import unittest
 from pathlib import Path
 from uuid import UUID
 
+from gacha_engine_service.catalog_config import static_catalog_snapshot
 from gacha_engine_service.postgres_state import PostgresGachaStateStore
-from gacha_engine_service.pull_operations import PullOperation, PullOperationClaim
+from gacha_engine_service.pull_operations import (
+    PullOperation,
+    PullOperationClaim,
+    PullRecoveryContext,
+)
 from gacha_engine_service.schemas import PityState
 from gacha_engine_service.state_store import PullOperationOwnershipLost
 
@@ -14,6 +19,7 @@ USER_ID = UUID("ae6b9d2e-9bb0-42c7-950f-c38ab6d7195e")
 OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
 REQUEST_HASH = "a" * 64
 PROCESSING_TOKEN = UUID("22222222-2222-4222-8222-222222222222")
+EVENT_ID = "33333333-3333-4333-8333-333333333333"
 
 
 class FakeTransaction:
@@ -89,9 +95,11 @@ def operation_row(
     *,
     status: str = "processing",
     processing_token: UUID | None = PROCESSING_TOKEN,
+    recovery_context: PullRecoveryContext | None = None,
 ) -> dict[str, object]:
     return {
         "id": OPERATION_ID,
+        "user_id": USER_ID,
         "status": status,
         "request_hash": REQUEST_HASH,
         "response": None,
@@ -99,14 +107,34 @@ def operation_row(
         "error_code": None,
         "error_message": None,
         "processing_token": processing_token,
+        "recovery_context": (
+            recovery_context.model_dump(mode="json")
+            if recovery_context is not None
+            else None
+        ),
     }
+
+
+def recovery_context() -> PullRecoveryContext:
+    banner_config = static_catalog_snapshot().banner_configs_by_id[
+        "limited-character-001"
+    ]
+    return PullRecoveryContext.from_banner_config(
+        banner_config=banner_config,
+        count=10,
+        seed="recoverable-seed",
+        event_id=EVENT_ID,
+        amount_minor=1600,
+        request_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
 
 
 class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_begin_pull_operation_creates_a_durable_fenced_lease(self) -> None:
+        context = recovery_context()
         connection = FakeConnection(
             fetchrow_results=[
-                operation_row(),
+                operation_row(recovery_context=context),
             ]
         )
         store = make_store(connection)
@@ -116,12 +144,18 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
             idempotency_key="pull-key",
             request_hash=REQUEST_HASH,
             processing_lease_seconds=30,
+            recovery_context=context,
         )
 
         self.assertEqual(
             claim,
             PullOperationClaim(
-                operation=PullOperation(status="processing", request_hash=REQUEST_HASH),
+                operation_key=str(OPERATION_ID),
+                operation=PullOperation(
+                    status="processing",
+                    request_hash=REQUEST_HASH,
+                    recovery_context=context,
+                ),
                 processing_token=claim.processing_token,
             ),
         )
@@ -129,7 +163,30 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         insert_call = connection.fetchrow_calls[0]
         self.assertIn("gacha_runtime.pull_operations", str(insert_call[0]))
         self.assertIn("processing_lease_until", str(insert_call[0]))
+        self.assertIn("recovery_context", str(insert_call[0]))
         self.assertNotIn("pull-key", insert_call)
+
+    async def test_expired_processing_operation_is_claimed_with_fencing_token(self) -> None:
+        context = recovery_context()
+        connection = FakeConnection(
+            fetchrow_results=[operation_row(recovery_context=context)]
+        )
+        store = make_store(connection)
+
+        claim = await store.claim_expired_processing_pull_operation(
+            operation_key=str(OPERATION_ID),
+            processing_lease_seconds=30,
+        )
+
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(claim.operation_key, str(OPERATION_ID))
+        self.assertEqual(claim.user_id, USER_ID)
+        self.assertEqual(claim.operation.recovery_context, context)
+        self.assertIsNotNone(claim.processing_token)
+        claim_sql = str(connection.fetchrow_calls[0][0])
+        self.assertIn("processing_lease_until < now()", claim_sql)
+        self.assertIn("recovery_context is not null", claim_sql)
 
     async def test_begin_pull_operation_reclaims_an_expired_processing_lease(self) -> None:
         connection = FakeConnection(fetchrow_results=[None, operation_row()])
@@ -234,6 +291,19 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("processing_token uuid", migration.lower())
         self.assertIn("processing_lease_until timestamptz", migration.lower())
         self.assertIn("where status = 'processing'", migration.lower())
+
+    def test_recovery_context_migration_is_expand_only_and_indexed(self) -> None:
+        migration = (
+            Path(__file__).parents[1]
+            / "migrations"
+            / "000003_pull_unattended_recovery.up.sql"
+        ).read_text(encoding="utf-8")
+
+        normalized = migration.lower()
+        self.assertIn("add column if not exists recovery_context jsonb", normalized)
+        self.assertIn("recovery_context is not null", normalized)
+        self.assertIn("create index concurrently", normalized)
+        self.assertNotIn("recovery_context jsonb not null", normalized)
 
 
 if __name__ == "__main__":
