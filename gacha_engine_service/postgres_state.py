@@ -147,6 +147,7 @@ class PostgresGachaStateStore:
                     request_hash,
                     processing_token,
                     lease_seconds,
+                    _model_json(recovery_context),
                 )
                 if claimed is not None:
                     return PullOperationClaim(
@@ -341,6 +342,26 @@ class PostgresGachaStateStore:
             for row in rows
         ]
 
+    async def iter_refund_pending_pull_operations(self, *, limit: int) -> list[PullOperationRecord]:
+        pool = await self._ensure_pool()
+        try:
+            async with pool.acquire() as connection:
+                rows = await connection.fetch(
+                    SELECT_REFUND_PENDING_OPERATIONS_SQL,
+                    max(1, limit),
+                )
+        except Exception as exc:
+            raise GachaStateStoreError("list pending pull refunds from postgres failed") from exc
+
+        return [
+            PullOperationRecord(
+                operation_key=str(row["id"]),
+                user_id=row["user_id"],
+                operation=_operation_from_row(row),
+            )
+            for row in rows
+        ]
+
     async def iter_expired_processing_pull_operations(
         self,
         *,
@@ -398,6 +419,7 @@ class PostgresGachaStateStore:
         self,
         *,
         operation_key: str,
+        expected_status: str,
         lock_ttl_seconds: int,
     ) -> bool:
         operation_id = _operation_id(operation_key)
@@ -408,6 +430,7 @@ class PostgresGachaStateStore:
                     CLAIM_PENDING_OPERATION_SQL,
                     operation_id,
                     max(1, lock_ttl_seconds),
+                    expected_status,
                 )
                 return row is not None
         except Exception as exc:
@@ -606,6 +629,7 @@ CLAIM_PROCESSING_OPERATION_SQL = """
 update gacha_runtime.pull_operations
 set processing_token = $4,
     processing_lease_until = now() + make_interval(secs => $5),
+    recovery_context = coalesce(recovery_context, $6::jsonb),
     updated_at = now()
 where user_id = $1
   and idempotency_key_hash = $2
@@ -698,6 +722,16 @@ order by updated_at, id
 limit $1
 """
 
+SELECT_REFUND_PENDING_OPERATIONS_SQL = """
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context
+from gacha_runtime.pull_operations
+where status = 'refund_pending'
+  and recovery_context is not null
+order by updated_at, id
+limit $1
+"""
+
 SELECT_EXPIRED_PROCESSING_OPERATIONS_SQL = """
 select id, user_id, status, request_hash, response, event, error_code,
        error_message, processing_token, recovery_context
@@ -727,7 +761,8 @@ update gacha_runtime.pull_operations
 set recovery_locked_until = now() + make_interval(secs => $2),
     updated_at = now()
 where id = $1
-  and status = 'event_pending'
+  and status = $3
+  and status in ('event_pending', 'refund_pending')
   and (recovery_locked_until is null or recovery_locked_until < now())
 returning id
 """

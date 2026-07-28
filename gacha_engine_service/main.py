@@ -1055,6 +1055,11 @@ async def run_pending_event_recovery_worker(
                 limit=batch_size,
                 lock_ttl_seconds=lock_ttl_seconds,
             )
+            recovered_refund_count = await recover_pending_pull_refunds_once(
+                services,
+                limit=batch_size,
+                lock_ttl_seconds=lock_ttl_seconds,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1068,6 +1073,8 @@ async def run_pending_event_recovery_worker(
             )
         if recovered_event_count:
             LOGGER.info("recovered pending pull events count=%s", recovered_event_count)
+        if recovered_refund_count:
+            LOGGER.info("recovered pending pull refunds count=%s", recovered_refund_count)
 
 
 async def recover_pending_pull_events_once(
@@ -1098,6 +1105,7 @@ async def recover_pending_pull_events_once(
         try:
             claimed = await services.state_store.claim_pull_operation_recovery(
                 operation_key=record.operation_key,
+                expected_status="event_pending",
                 lock_ttl_seconds=lock_ttl_seconds,
             )
         except GachaStateStoreError:
@@ -1145,6 +1153,97 @@ async def recover_pending_pull_events_once(
             except GachaStateStoreError:
                 LOGGER.warning(
                     "failed to release pending pull event recovery lock event_id=%s",
+                    event_id,
+                    exc_info=True,
+                )
+
+    return recovered_count
+
+
+async def recover_pending_pull_refunds_once(
+    services: AppServices,
+    *,
+    limit: int,
+    lock_ttl_seconds: int,
+) -> int:
+    try:
+        pending_operations = await services.state_store.iter_refund_pending_pull_operations(
+            limit=limit,
+        )
+    except GachaStateStoreError:
+        LOGGER.warning("failed to scan pending pull refunds", exc_info=True)
+        return 0
+
+    recovered_count = 0
+    for record in pending_operations:
+        operation = record.operation
+        context = operation.recovery_context
+        if operation.status != "refund_pending" or context is None:
+            continue
+
+        event_id = str(context.event_id)
+        try:
+            claimed = await services.state_store.claim_pull_operation_recovery(
+                operation_key=record.operation_key,
+                expected_status="refund_pending",
+                lock_ttl_seconds=lock_ttl_seconds,
+            )
+        except GachaStateStoreError:
+            LOGGER.warning(
+                "failed to claim pending pull refund event_id=%s",
+                event_id,
+                exc_info=True,
+            )
+            continue
+
+        if not claimed:
+            continue
+
+        metadata = pull_asset_metadata(
+            event_id=event_id,
+            banner_id=context.banner.id,
+            banner_version_id=context.banner_version_id,
+            count=context.count,
+        )
+        try:
+            await refund_claimed_spend(
+                services=services,
+                user_id=record.user_id,
+                operation_key=record.operation_key,
+                request_hash=operation.request_hash,
+                context=context,
+                metadata=metadata,
+                code=operation.error_code or "pull_refunded",
+                message=operation.error_message or "pull was refunded",
+            )
+            recovered_count += 1
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            LOGGER.warning(
+                "pending pull refund recovery deferred event_id=%s status=%s code=%s",
+                event_id,
+                exc.status_code,
+                detail.get("code", "refund_recovery_failed"),
+            )
+        except GachaStateStoreError:
+            LOGGER.warning(
+                "failed to mark pending pull refund complete event_id=%s",
+                event_id,
+                exc_info=True,
+            )
+        except Exception:
+            LOGGER.exception(
+                "unexpected pending pull refund recovery failure event_id=%s",
+                event_id,
+            )
+        finally:
+            try:
+                await services.state_store.release_pull_operation_recovery(
+                    operation_key=record.operation_key,
+                )
+            except GachaStateStoreError:
+                LOGGER.warning(
+                    "failed to release pending pull refund recovery lock event_id=%s",
                     event_id,
                     exc_info=True,
                 )

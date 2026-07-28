@@ -25,3 +25,7 @@ alter table gacha_runtime.pull_operations
 create index concurrently if not exists pull_operations_processing_recovery_idx
   on gacha_runtime.pull_operations (processing_lease_until, id)
   where status = 'processing' and recovery_context is not null;
+
+create index concurrently if not exists pull_operations_refund_pending_recovery_idx
+  on gacha_runtime.pull_operations (updated_at, id)
+  where status = 'refund_pending' and recovery_context is not null;

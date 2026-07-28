@@ -1,3 +1,4 @@
+drop index concurrently if exists gacha_runtime.pull_operations_refund_pending_recovery_idx;
 drop index concurrently if exists gacha_runtime.pull_operations_processing_recovery_idx;
 
 alter table gacha_runtime.pull_operations
