@@ -134,9 +134,13 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         context = recovery_context()
 
         restored = PullRecoveryContext.model_validate_json(context.model_dump_json())
+        legacy_payload = context.model_dump(mode="json")
+        legacy_payload.pop("pity_group_id", None)
+        restored_legacy = PullRecoveryContext.model_validate(legacy_payload)
 
         self.assertEqual(context.pity_group_id, "limited-character-001")
         self.assertEqual(restored.pity_group_id, context.pity_group_id)
+        self.assertEqual(restored_legacy.pity_group_id, context.banner.id)
         self.assertEqual(
             restored.to_banner_config().pity_group_id,
             context.pity_group_id,
