@@ -52,6 +52,8 @@ IDEMPOTENCY_HEADER = "Idempotency-Key"
 REQUEST_ID_HEADER = "X-Request-Id"
 MAX_IDEMPOTENCY_KEY_LENGTH = 128
 PULL_PROCESSING_LEASE_SECONDS = 30
+PITY_COMMIT_MAX_ATTEMPTS = 5
+PITY_COMMIT_RETRY_DELAY_SECONDS = 0.01
 PULL_EVENT_NAMESPACE = uuid.UUID("d19f2db2-5d10-4dbf-95ee-2680ab82d908")
 
 
@@ -487,91 +489,14 @@ async def execute_claimed_pull(
         raise asset_http_exception(exc) from exc
 
     try:
-        previous_pity = await services.state_store.get_snapshot(user_id, banner.id)
-        records, next_pity_state = perform_pulls(
-            banner_config=banner_config,
-            count=context.count,
-            pity=previous_pity.without_version(),
-            seed=context.seed,
-        )
-        next_pity = PitySnapshot(
-            **next_pity_state.model_dump(),
-            version=previous_pity.version + 1,
-        )
-        response = PullResponse(
-            event_id=event_id,
-            banner_version_id=context.banner_version_id,
-            seed=context.seed,
-            records=records,
-            previous_pity=previous_pity,
-            next_pity=next_pity,
-            state_version=next_pity.version,
-        )
-        event = PullCompletedEvent(
-            event_id=event_id,
-            user_id=str(user_id),
-            banner_id=banner.id,
-            banner_version_id=context.banner_version_id,
-            seed=context.seed,
-            records=records,
-            previous_pity=previous_pity,
-            next_pity=next_pity,
-            state_version=next_pity.version,
-        )
-        await services.state_store.compare_and_set_with_pull_operation(
-            operation_key=operation_key,
-            user_id=user_id,
-            banner_id=banner.id,
-            request_hash=request_hash,
-            expected_version=previous_pity.version,
-            next_pity=next_pity_state,
-            operation=PullOperation(
-                status="event_pending",
-                request_hash=request_hash,
-                response=response,
-                event=event,
-            ),
-            processing_token=processing_token,
-        )
-    except PityVersionConflict as exc:
-        message = f"pity state was updated at version {exc.current_version}"
-        try:
-            await services.state_store.transition_pull_operation_from_processing(
-                operation_key=operation_key,
-                user_id=user_id,
-                request_hash=request_hash,
-                processing_token=processing_token,
-                operation=PullOperation(
-                    status="refund_pending",
-                    request_hash=request_hash,
-                    response=response,
-                    event=event,
-                    error_code="pity_version_conflict",
-                    error_message=message,
-                    recovery_context=context,
-                ),
-            )
-        except PullOperationOwnershipLost as ownership_error:
-            raise pull_in_progress_http_exception() from ownership_error
-        except GachaStateStoreError as state_error:
-            raise state_store_http_exception(
-                "pull refund could not be scheduled"
-            ) from state_error
-
-        await refund_claimed_spend(
+        response, event = await generate_and_commit_pull_with_retry(
             services=services,
             user_id=user_id,
             operation_key=operation_key,
             request_hash=request_hash,
+            processing_token=processing_token,
             context=context,
-            metadata=metadata,
-            code="pity_version_conflict",
-            message=message,
         )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "pity_version_conflict", "message": message},
-        ) from exc
     except PullOperationOwnershipLost as exc:
         raise pull_in_progress_http_exception() from exc
     except GachaStateStoreError as exc:
@@ -605,6 +530,90 @@ async def execute_claimed_pull(
         response=response,
         event=event,
     )
+
+
+async def generate_and_commit_pull_with_retry(
+    *,
+    services: AppServices,
+    user_id: UUID,
+    operation_key: str,
+    request_hash: str,
+    processing_token: UUID,
+    context: PullRecoveryContext,
+) -> tuple[PullResponse, PullCompletedEvent]:
+    banner_config = context.to_banner_config()
+    banner = banner_config.banner
+    event_id = str(context.event_id)
+
+    for attempt in range(1, PITY_COMMIT_MAX_ATTEMPTS + 1):
+        previous_pity = await services.state_store.get_snapshot(user_id, banner.id)
+        records, next_pity_state = perform_pulls(
+            banner_config=banner_config,
+            count=context.count,
+            pity=previous_pity.without_version(),
+            seed=context.seed,
+        )
+        next_pity = PitySnapshot(
+            **next_pity_state.model_dump(),
+            version=previous_pity.version + 1,
+        )
+        response = PullResponse(
+            event_id=event_id,
+            banner_version_id=context.banner_version_id,
+            seed=context.seed,
+            records=records,
+            previous_pity=previous_pity,
+            next_pity=next_pity,
+            state_version=next_pity.version,
+        )
+        event = PullCompletedEvent(
+            event_id=event_id,
+            user_id=str(user_id),
+            banner_id=banner.id,
+            banner_version_id=context.banner_version_id,
+            seed=context.seed,
+            records=records,
+            previous_pity=previous_pity,
+            next_pity=next_pity,
+            state_version=next_pity.version,
+        )
+
+        try:
+            await services.state_store.compare_and_set_with_pull_operation(
+                operation_key=operation_key,
+                user_id=user_id,
+                banner_id=banner.id,
+                request_hash=request_hash,
+                expected_version=previous_pity.version,
+                next_pity=next_pity_state,
+                operation=PullOperation(
+                    status="event_pending",
+                    request_hash=request_hash,
+                    response=response,
+                    event=event,
+                ),
+                processing_token=processing_token,
+            )
+            return response, event
+        except PityVersionConflict as exc:
+            LOGGER.info(
+                "pity state changed; recalculating pull event_id=%s attempt=%s/%s current_version=%s",
+                event_id,
+                attempt,
+                PITY_COMMIT_MAX_ATTEMPTS,
+                exc.current_version,
+            )
+            if attempt == PITY_COMMIT_MAX_ATTEMPTS:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "pull_recovery_pending",
+                        "message": "pull is queued behind another pull and will continue automatically",
+                    },
+                ) from exc
+            await asyncio.sleep(PITY_COMMIT_RETRY_DELAY_SECONDS * attempt)
+
+    raise RuntimeError("pity commit retry loop exited unexpectedly")
 
 
 async def handle_claimed_pull_operation(
