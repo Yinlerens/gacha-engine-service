@@ -8,17 +8,18 @@ from uuid import UUID
 from fastapi.testclient import TestClient
 
 from gacha_engine_service.asset_client import AssetServiceError
-from gacha_engine_service.catalog_config import CatalogSnapshot
+from gacha_engine_service.catalog_config import CatalogSnapshot, static_catalog_snapshot
 from gacha_engine_service.config import Settings
 from gacha_engine_service.main import (
     AppServices,
     create_app,
+    execute_claimed_pull,
     recover_expired_processing_pulls_once,
     recover_pending_pull_events_once,
     recover_pending_pull_refunds_once,
 )
 from gacha_engine_service.postgres_state import PostgresGachaStateStore
-from gacha_engine_service.pull_operations import PullOperation
+from gacha_engine_service.pull_operations import PullOperation, PullRecoveryContext
 from gacha_engine_service.schemas import PitySnapshot
 
 from .fakes import FakeAssetClient, FakeEventPublisher, FakePityStateStore
@@ -52,6 +53,31 @@ def make_client(
         catalog_repository=catalog_repository,
     )
     return TestClient(app), state_store, event_publisher, asset_client
+
+
+def seed_pending_refund(state_store: FakePityStateStore) -> None:
+    banner_config = static_catalog_snapshot().banner_configs_by_id[
+        "limited-character-001"
+    ]
+    context = PullRecoveryContext.from_banner_config(
+        banner_config=banner_config,
+        count=1,
+        seed="pending-refund",
+        event_id="44444444-4444-4444-8444-444444444444",
+        amount_minor=160,
+        request_id=REQUEST_ID,
+    )
+    key = (UUID(USER_ID), HEADERS["Idempotency-Key"])
+    operation_key = "55555555-5555-4555-8555-555555555555"
+    state_store.operations[key] = PullOperation(
+        status="refund_pending",
+        request_hash="f" * 64,
+        error_code="pull_compensation_required",
+        error_message="refund is pending",
+        recovery_context=context,
+    )
+    state_store.operation_ids[key] = operation_key
+    state_store.operation_keys[operation_key] = key
 
 
 class EmptyCatalogRepository:
@@ -470,7 +496,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.credits), 0)
         self.assertEqual(len(event_publisher.events), 0)
 
-    def test_pull_returns_conflict_when_pity_version_changes(self) -> None:
+    def test_persistent_pity_contention_is_deferred_without_refund(self) -> None:
         client, _, _, asset_client = make_client(state_store=FakePityStateStore(conflict=True))
 
         response = client.post(
@@ -479,14 +505,70 @@ class ApiTests(unittest.TestCase):
             headers=HEADERS,
         )
 
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json()["error"]["code"], "pity_version_conflict")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "pull_recovery_pending")
         self.assertEqual(len(asset_client.spends), 1)
-        self.assertEqual(len(asset_client.credits), 1)
-        self.assertEqual(asset_client.credits[0]["reason"], "gacha_pull_refund")
+        self.assertEqual(asset_client.credits, [])
+
+    def test_two_concurrent_pulls_recalculate_from_the_committed_pity(self) -> None:
+        state_store = FakePityStateStore(synchronized_snapshot_readers=2)
+        event_publisher = FakeEventPublisher()
+        asset_client = FakeAssetClient()
+        services = AppServices(state_store, event_publisher, object(), asset_client)
+        banner_config = static_catalog_snapshot().banner_configs_by_id[
+            "limited-character-001"
+        ]
+
+        async def execute_two_pulls() -> list[object]:
+            executions: list[object] = []
+            for index in range(2):
+                context = PullRecoveryContext.from_banner_config(
+                    banner_config=banner_config,
+                    count=10,
+                    seed=f"concurrent-{index}",
+                    event_id=f"66666666-6666-4666-8666-66666666666{index}",
+                    amount_minor=1600,
+                    request_id=REQUEST_ID,
+                )
+                request_hash = str(index + 1) * 64
+                claim = await state_store.begin_pull_operation(
+                    user_id=UUID(USER_ID),
+                    idempotency_key=f"concurrent-pull-{index}",
+                    request_hash=request_hash,
+                    processing_lease_seconds=30,
+                    recovery_context=context,
+                )
+                assert claim.processing_token is not None
+                executions.append(
+                    execute_claimed_pull(
+                        services=services,
+                        user_id=UUID(USER_ID),
+                        operation_key=claim.operation_key,
+                        request_hash=request_hash,
+                        processing_token=claim.processing_token,
+                        context=context,
+                    )
+                )
+            return list(await asyncio.gather(*executions))
+
+        responses = asyncio.run(execute_two_pulls())
+
+        self.assertEqual(
+            sorted(response.previous_pity.version for response in responses),
+            [0, 1],
+        )
+        self.assertEqual(
+            sorted(response.next_pity.version for response in responses),
+            [1, 2],
+        )
+        self.assertEqual(state_store.snapshot.version, 2)
+        self.assertEqual(len(asset_client.spends), 2)
+        self.assertEqual(asset_client.credits, [])
+        self.assertEqual(len(event_publisher.events), 2)
 
     def test_refund_is_persisted_before_asset_credit(self) -> None:
-        state_store = FakePityStateStore(conflict=True)
+        state_store = FakePityStateStore()
+        seed_pending_refund(state_store)
         status_during_credit: list[str] = []
         operation_key = (UUID(USER_ID), HEADERS["Idempotency-Key"])
         asset_client = FakeAssetClient(
@@ -494,22 +576,20 @@ class ApiTests(unittest.TestCase):
                 state_store.operations[operation_key].status
             )
         )
-        client, _, _, _ = make_client(
-            state_store=state_store,
-            asset_client=asset_client,
+        recovered_count = asyncio.run(
+            recover_pending_pull_refunds_once(
+                AppServices(state_store, FakeEventPublisher(), object(), asset_client),
+                limit=10,
+                lock_ttl_seconds=30,
+            )
         )
 
-        response = client.post(
-            "/v1/me/pulls",
-            json={"banner_id": "limited-character-001", "count": 1, "seed": "conflict"},
-            headers=HEADERS,
-        )
-
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(recovered_count, 1)
         self.assertEqual(status_during_credit, ["refund_pending"])
 
     def test_pending_refund_recovers_without_another_client_request(self) -> None:
-        state_store = FakePityStateStore(conflict=True)
+        state_store = FakePityStateStore()
+        seed_pending_refund(state_store)
         asset_client = FakeAssetClient(
             credit_error=AssetServiceError(
                 503,
@@ -517,20 +597,17 @@ class ApiTests(unittest.TestCase):
                 "asset service timed out",
             )
         )
-        client, state_store, event_publisher, asset_client = make_client(
-            state_store=state_store,
-            asset_client=asset_client,
-        )
+        services = AppServices(state_store, FakeEventPublisher(), object(), asset_client)
 
-        first = client.post(
-            "/v1/me/pulls",
-            json={"banner_id": "limited-character-001", "count": 1, "seed": "refund-recovery"},
-            headers=HEADERS,
+        deferred_recovery = asyncio.run(
+            recover_pending_pull_refunds_once(
+                services,
+                limit=10,
+                lock_ttl_seconds=30,
+            )
         )
         asset_client.credit_error = None
-        services = AppServices(state_store, event_publisher, object(), asset_client)
-
-        first_recovery = asyncio.run(
+        completed_recovery = asyncio.run(
             recover_pending_pull_refunds_once(
                 services,
                 limit=10,
@@ -545,31 +622,19 @@ class ApiTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(first.status_code, 503)
-        self.assertEqual(first_recovery, 1)
+        self.assertEqual(deferred_recovery, 0)
+        self.assertEqual(completed_recovery, 1)
         self.assertEqual(second_recovery, 0)
-        self.assertEqual(len(asset_client.spends), 1)
         self.assertEqual(len(asset_client.credits), 1)
         operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
         self.assertEqual(operation.status, "failed")
         self.assertIsNone(operation.recovery_context)
 
     def test_two_refund_workers_only_complete_one_refund(self) -> None:
-        state_store = FakePityStateStore(conflict=True)
-        asset_client = FakeAssetClient(
-            credit_error=AssetServiceError(503, "asset_unavailable", "temporary outage")
-        )
-        client, state_store, event_publisher, asset_client = make_client(
-            state_store=state_store,
-            asset_client=asset_client,
-        )
-        first = client.post(
-            "/v1/me/pulls",
-            json={"banner_id": "limited-character-001", "count": 1, "seed": "refund-race"},
-            headers=HEADERS,
-        )
-        asset_client.credit_error = None
-        services = AppServices(state_store, event_publisher, object(), asset_client)
+        state_store = FakePityStateStore()
+        seed_pending_refund(state_store)
+        asset_client = FakeAssetClient()
+        services = AppServices(state_store, FakeEventPublisher(), object(), asset_client)
 
         async def recover_concurrently() -> list[int]:
             return list(
@@ -589,7 +654,6 @@ class ApiTests(unittest.TestCase):
 
         recovered_counts = asyncio.run(recover_concurrently())
 
-        self.assertEqual(first.status_code, 503)
         self.assertEqual(sum(recovered_counts), 1)
         self.assertEqual(len(asset_client.credits), 1)
 

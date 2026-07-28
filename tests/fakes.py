@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import uuid
 from uuid import UUID
@@ -33,6 +34,7 @@ class FakePityStateStore:
         commit_unavailable: bool = False,
         commit_ack_lost: bool = False,
         ownership_lost_on_commit: bool = False,
+        synchronized_snapshot_readers: int = 0,
     ) -> None:
         self.snapshot = snapshot or PitySnapshot(**create_initial_pity().model_dump(), version=0)
         self.ping_error = ping_error
@@ -41,6 +43,12 @@ class FakePityStateStore:
         self.commit_unavailable = commit_unavailable
         self.commit_ack_lost = commit_ack_lost
         self.ownership_lost_on_commit = ownership_lost_on_commit
+        self.snapshot_read_barrier = (
+            asyncio.Barrier(synchronized_snapshot_readers)
+            if synchronized_snapshot_readers >= 2
+            else None
+        )
+        self.synchronized_snapshot_reads_remaining = synchronized_snapshot_readers
         self.closed = False
         self.operations: dict[tuple[UUID, str], PullOperation] = {}
         self.operation_ids: dict[tuple[UUID, str], str] = {}
@@ -59,7 +67,14 @@ class FakePityStateStore:
     async def get_snapshot(self, user_id: UUID, banner_id: str) -> PitySnapshot:
         if self.unavailable:
             raise GachaStateStoreError("state database is unavailable")
-        return self.snapshot
+        snapshot = self.snapshot
+        if (
+            self.snapshot_read_barrier is not None
+            and self.synchronized_snapshot_reads_remaining > 0
+        ):
+            self.synchronized_snapshot_reads_remaining -= 1
+            await self.snapshot_read_barrier.wait()
+        return snapshot
 
     async def compare_and_set(
         self,
