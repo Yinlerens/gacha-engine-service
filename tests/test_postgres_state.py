@@ -189,7 +189,10 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("recovery_context is not null", claim_sql)
 
     async def test_begin_pull_operation_reclaims_an_expired_processing_lease(self) -> None:
-        connection = FakeConnection(fetchrow_results=[None, operation_row()])
+        context = recovery_context()
+        connection = FakeConnection(
+            fetchrow_results=[None, operation_row(recovery_context=context)]
+        )
         store = make_store(connection)
 
         claim = await store.begin_pull_operation(
@@ -197,6 +200,7 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
             idempotency_key="pull-key",
             request_hash=REQUEST_HASH,
             processing_lease_seconds=30,
+            recovery_context=context,
         )
 
         self.assertIsNotNone(claim.processing_token)
@@ -204,7 +208,10 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("processing_lease_until < now()", str(connection.fetchrow_calls[1][0]))
 
     async def test_begin_pull_operation_does_not_take_an_active_lease(self) -> None:
-        connection = FakeConnection(fetchrow_results=[None, None, operation_row()])
+        context = recovery_context()
+        connection = FakeConnection(
+            fetchrow_results=[None, None, operation_row(recovery_context=context)]
+        )
         store = make_store(connection)
 
         claim = await store.begin_pull_operation(
@@ -212,6 +219,7 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
             idempotency_key="pull-key",
             request_hash=REQUEST_HASH,
             processing_lease_seconds=30,
+            recovery_context=context,
         )
 
         self.assertIsNone(claim.processing_token)
@@ -233,9 +241,9 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         pending = PullOperation(status="event_pending", request_hash=REQUEST_HASH)
 
         snapshot = await store.compare_and_set_with_pull_operation(
+            operation_key=str(OPERATION_ID),
             user_id=USER_ID,
             banner_id="limited-character-001",
-            idempotency_key="pull-key",
             request_hash=REQUEST_HASH,
             expected_version=0,
             next_pity=PityState(since_five=1, since_four=1),
@@ -257,9 +265,9 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(PullOperationOwnershipLost):
             await store.compare_and_set_with_pull_operation(
+                operation_key=str(OPERATION_ID),
                 user_id=USER_ID,
                 banner_id="limited-character-001",
-                idempotency_key="pull-key",
                 request_hash=REQUEST_HASH,
                 expected_version=0,
                 next_pity=PityState(since_five=1, since_four=1),

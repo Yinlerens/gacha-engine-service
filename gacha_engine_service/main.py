@@ -27,7 +27,7 @@ from .config import Settings
 from .engine import perform_pulls
 from .kafka_events import EventPublishError, KafkaEventPublisher
 from .postgres_state import PostgresGachaStateStore
-from .pull_operations import PullOperation
+from .pull_operations import PullOperation, PullRecoveryContext
 from .schemas import (
     ApiError,
     ErrorResponse,
@@ -360,6 +360,14 @@ def register_routes(app: FastAPI) -> None:
         )
         cost_minor = pull_request.count * ASTRITE_PER_PULL
         event_id = deterministic_pull_event_id(user_id, idempotency_key)
+        recovery_context = PullRecoveryContext.from_banner_config(
+            banner_config=banner_config,
+            count=pull_request.count,
+            seed=seed,
+            event_id=event_id,
+            amount_minor=cost_minor,
+            request_id=request_id,
+        )
 
         try:
             operation_claim = await services.state_store.begin_pull_operation(
@@ -367,6 +375,7 @@ def register_routes(app: FastAPI) -> None:
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
                 processing_lease_seconds=PULL_PROCESSING_LEASE_SECONDS,
+                recovery_context=recovery_context,
             )
         except GachaStateStoreError as exc:
             raise HTTPException(
@@ -378,218 +387,299 @@ def register_routes(app: FastAPI) -> None:
             ) from exc
 
         if not operation_claim.acquired:
+            existing_context = (
+                operation_claim.operation.recovery_context or recovery_context
+            )
             return await handle_existing_pull_operation(
                 operation=operation_claim.operation,
                 services=services,
                 user_id=user_id,
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
-                event_id=event_id,
-                amount_minor=cost_minor,
+                event_id=str(existing_context.event_id),
+                amount_minor=existing_context.amount_minor,
                 request_id=request_id,
                 metadata=pull_asset_metadata(
-                    event_id=event_id,
-                    banner_id=banner.id,
-                    banner_version_id=banner_config.banner_version_id,
-                    count=pull_request.count,
+                    event_id=str(existing_context.event_id),
+                    banner_id=existing_context.banner.id,
+                    banner_version_id=existing_context.banner_version_id,
+                    count=existing_context.count,
                 ),
             )
 
         processing_token = operation_claim.processing_token
         if processing_token is None:
             raise RuntimeError("acquired pull operation is missing its processing token")
-
-        metadata = pull_asset_metadata(
-            event_id=event_id,
-            banner_id=banner.id,
-            banner_version_id=banner_config.banner_version_id,
-            count=pull_request.count,
+        claimed_context = operation_claim.operation.recovery_context or recovery_context
+        return await execute_claimed_pull(
+            services=services,
+            user_id=user_id,
+            operation_key=operation_claim.operation_key,
+            request_hash=request_hash,
+            processing_token=processing_token,
+            context=claimed_context,
         )
 
+
+async def execute_claimed_pull(
+    *,
+    services: AppServices,
+    user_id: UUID,
+    operation_key: str,
+    request_hash: str,
+    processing_token: UUID,
+    context: PullRecoveryContext,
+) -> PullResponse:
+    banner_config = context.to_banner_config()
+    banner = banner_config.banner
+    event_id = str(context.event_id)
+    metadata = pull_asset_metadata(
+        event_id=event_id,
+        banner_id=banner.id,
+        banner_version_id=context.banner_version_id,
+        count=context.count,
+    )
+
+    try:
+        await services.asset_client.spend(
+            user_id=user_id,
+            amount_minor=context.amount_minor,
+            idempotency_key=spend_idempotency_key(event_id),
+            reason="gacha_pull",
+            metadata=metadata,
+            request_id=context.request_id,
+        )
+    except AssetServiceError as exc:
+        LOGGER.warning(
+            "asset spend failed request_id=%s status=%s code=%s",
+            context.request_id,
+            exc.status_code,
+            exc.code,
+        )
+        if exc.status_code >= 500:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "asset_unavailable",
+                    "message": "asset spend outcome is being reconciled",
+                },
+            ) from exc
+
         try:
-            await services.asset_client.spend(
+            await services.state_store.transition_pull_operation_from_processing(
+                operation_key=operation_key,
                 user_id=user_id,
-                amount_minor=cost_minor,
-                idempotency_key=spend_idempotency_key(event_id),
-                reason="gacha_pull",
-                metadata=metadata,
-                request_id=request_id,
-            )
-        except AssetServiceError as exc:
-            LOGGER.warning(
-                "asset spend failed request_id=%s status=%s code=%s",
-                request_id,
-                exc.status_code,
-                exc.code,
-            )
-            if exc.status_code >= 500:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail={
-                        "code": "asset_unavailable",
-                        "message": "asset spend outcome is being reconciled",
-                    },
-                ) from exc
-
-            try:
-                await services.state_store.transition_pull_operation_from_processing(
-                    user_id=user_id,
-                    idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                processing_token=processing_token,
+                operation=PullOperation(
+                    status="failed",
                     request_hash=request_hash,
-                    processing_token=processing_token,
-                    operation=PullOperation(
-                        status="failed",
-                        request_hash=request_hash,
-                        error_code=asset_error_code(exc),
-                        error_message=asset_error_message(exc),
-                    ),
-                )
-            except PullOperationOwnershipLost as ownership_error:
-                raise pull_in_progress_http_exception() from ownership_error
-            except GachaStateStoreError as state_error:
-                raise state_store_http_exception(
-                    "pull failure could not be persisted"
-                ) from state_error
-            raise asset_http_exception(exc) from exc
+                    error_code=asset_error_code(exc),
+                    error_message=asset_error_message(exc),
+                ),
+            )
+        except PullOperationOwnershipLost as ownership_error:
+            raise pull_in_progress_http_exception() from ownership_error
+        except GachaStateStoreError as state_error:
+            raise state_store_http_exception(
+                "pull failure could not be persisted"
+            ) from state_error
+        raise asset_http_exception(exc) from exc
 
-        try:
-            previous_pity = await services.state_store.get_snapshot(user_id, banner.id)
-            records, next_pity_state = perform_pulls(
-                banner_config=banner_config,
-                count=pull_request.count,
-                pity=previous_pity.without_version(),
-                seed=seed,
-            )
-            next_pity = PitySnapshot(
-                **next_pity_state.model_dump(),
-                version=previous_pity.version + 1,
-            )
-            response = PullResponse(
-                event_id=event_id,
-                banner_version_id=banner_config.banner_version_id,
-                seed=seed,
-                records=records,
-                previous_pity=previous_pity,
-                next_pity=next_pity,
-                state_version=next_pity.version,
-            )
-            event = PullCompletedEvent(
-                event_id=event_id,
-                user_id=str(user_id),
-                banner_id=banner.id,
-                banner_version_id=banner_config.banner_version_id,
-                seed=seed,
-                records=records,
-                previous_pity=previous_pity,
-                next_pity=next_pity,
-                state_version=next_pity.version,
-            )
-            pending_operation = PullOperation(
+    try:
+        previous_pity = await services.state_store.get_snapshot(user_id, banner.id)
+        records, next_pity_state = perform_pulls(
+            banner_config=banner_config,
+            count=context.count,
+            pity=previous_pity.without_version(),
+            seed=context.seed,
+        )
+        next_pity = PitySnapshot(
+            **next_pity_state.model_dump(),
+            version=previous_pity.version + 1,
+        )
+        response = PullResponse(
+            event_id=event_id,
+            banner_version_id=context.banner_version_id,
+            seed=context.seed,
+            records=records,
+            previous_pity=previous_pity,
+            next_pity=next_pity,
+            state_version=next_pity.version,
+        )
+        event = PullCompletedEvent(
+            event_id=event_id,
+            user_id=str(user_id),
+            banner_id=banner.id,
+            banner_version_id=context.banner_version_id,
+            seed=context.seed,
+            records=records,
+            previous_pity=previous_pity,
+            next_pity=next_pity,
+            state_version=next_pity.version,
+        )
+        await services.state_store.compare_and_set_with_pull_operation(
+            operation_key=operation_key,
+            user_id=user_id,
+            banner_id=banner.id,
+            request_hash=request_hash,
+            expected_version=previous_pity.version,
+            next_pity=next_pity_state,
+            operation=PullOperation(
                 status="event_pending",
                 request_hash=request_hash,
                 response=response,
                 event=event,
-            )
-            await services.state_store.compare_and_set_with_pull_operation(
-                user_id=user_id,
-                banner_id=banner.id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-                expected_version=previous_pity.version,
-                next_pity=next_pity_state,
-                operation=pending_operation,
-                processing_token=processing_token,
-            )
-        except PityVersionConflict as exc:
-            try:
-                await services.state_store.transition_pull_operation_from_processing(
-                    user_id=user_id,
-                    idempotency_key=idempotency_key,
-                    request_hash=request_hash,
-                    processing_token=processing_token,
-                    operation=PullOperation(
-                        status="refund_pending",
-                        request_hash=request_hash,
-                        response=response,
-                        event=event,
-                        error_code="pity_version_conflict",
-                        error_message=(
-                            f"pity state was updated at version {exc.current_version}"
-                        ),
-                    ),
-                )
-            except PullOperationOwnershipLost as ownership_error:
-                raise pull_in_progress_http_exception() from ownership_error
-            except GachaStateStoreError as state_error:
-                raise state_store_http_exception(
-                    "pull refund could not be scheduled"
-                ) from state_error
-
-            await refund_spend(
-                services=services,
-                user_id=user_id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-                event_id=event_id,
-                amount_minor=cost_minor,
-                metadata=metadata,
-                request_id=request_id,
-                code="pity_version_conflict",
-                message=f"pity state was updated at version {exc.current_version}",
-            )
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "code": "pity_version_conflict",
-                    "message": f"pity state was updated at version {exc.current_version}",
-                },
-            ) from exc
-        except PullOperationOwnershipLost as exc:
-            raise pull_in_progress_http_exception() from exc
-        except GachaStateStoreError as exc:
-            try:
-                reconciled_operation = await services.state_store.get_pull_operation(
-                    user_id=user_id,
-                    idempotency_key=idempotency_key,
-                )
-            except GachaStateStoreError:
-                reconciled_operation = None
-
-            if (
-                reconciled_operation is not None
-                and reconciled_operation.status != "processing"
-            ):
-                return await handle_existing_pull_operation(
-                    operation=reconciled_operation,
-                    services=services,
-                    user_id=user_id,
-                    idempotency_key=idempotency_key,
-                    request_hash=request_hash,
-                    event_id=event_id,
-                    amount_minor=cost_minor,
-                    request_id=request_id,
-                    metadata=metadata,
-                )
-
-            raise state_store_http_exception(
-                "pull outcome is being reconciled"
-            ) from exc
-
+            ),
+            processing_token=processing_token,
+        )
+    except PityVersionConflict as exc:
+        message = f"pity state was updated at version {exc.current_version}"
         try:
-            await publish_pull_completed_with_retry(services.event_publisher, event)
-        except EventPublishError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "code": "kafka_unavailable",
-                    "message": "pull event could not be published",
-                },
-            ) from exc
+            await services.state_store.transition_pull_operation_from_processing(
+                operation_key=operation_key,
+                user_id=user_id,
+                request_hash=request_hash,
+                processing_token=processing_token,
+                operation=PullOperation(
+                    status="refund_pending",
+                    request_hash=request_hash,
+                    response=response,
+                    event=event,
+                    error_code="pity_version_conflict",
+                    error_message=message,
+                    recovery_context=context,
+                ),
+            )
+        except PullOperationOwnershipLost as ownership_error:
+            raise pull_in_progress_http_exception() from ownership_error
+        except GachaStateStoreError as state_error:
+            raise state_store_http_exception(
+                "pull refund could not be scheduled"
+            ) from state_error
 
-        await save_pull_operation_best_effort(
+        await refund_claimed_spend(
             services=services,
             user_id=user_id,
-            idempotency_key=idempotency_key,
+            operation_key=operation_key,
+            request_hash=request_hash,
+            context=context,
+            metadata=metadata,
+            code="pity_version_conflict",
+            message=message,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "pity_version_conflict", "message": message},
+        ) from exc
+    except PullOperationOwnershipLost as exc:
+        raise pull_in_progress_http_exception() from exc
+    except GachaStateStoreError as exc:
+        try:
+            reconciled_operation = await services.state_store.get_pull_operation_by_key(
+                operation_key=operation_key,
+            )
+        except GachaStateStoreError:
+            reconciled_operation = None
+
+        if (
+            reconciled_operation is not None
+            and reconciled_operation.status != "processing"
+        ):
+            return await handle_claimed_pull_operation(
+                operation=reconciled_operation,
+                services=services,
+                user_id=user_id,
+                operation_key=operation_key,
+                request_hash=request_hash,
+                context=context,
+                metadata=metadata,
+            )
+
+        raise state_store_http_exception("pull outcome is being reconciled") from exc
+
+    return await publish_and_complete_claimed_pull(
+        services=services,
+        operation_key=operation_key,
+        request_hash=request_hash,
+        response=response,
+        event=event,
+    )
+
+
+async def handle_claimed_pull_operation(
+    *,
+    operation: PullOperation,
+    services: AppServices,
+    user_id: UUID,
+    operation_key: str,
+    request_hash: str,
+    context: PullRecoveryContext,
+    metadata: dict[str, object],
+) -> PullResponse:
+    if operation.request_hash != request_hash:
+        raise state_store_http_exception("pull operation request changed")
+    if operation.status == "succeeded" and operation.response is not None:
+        return operation.response
+    if operation.status == "event_pending" and operation.response is not None and operation.event is not None:
+        return await publish_and_complete_claimed_pull(
+            services=services,
+            operation_key=operation_key,
+            request_hash=request_hash,
+            response=operation.response,
+            event=operation.event,
+        )
+    if operation.status == "refund_pending":
+        await refund_claimed_spend(
+            services=services,
+            user_id=user_id,
+            operation_key=operation_key,
+            request_hash=request_hash,
+            context=context,
+            metadata=metadata,
+            code=operation.error_code or "pull_refunded",
+            message=operation.error_message or "pull was refunded",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "pull_refunded",
+                "message": "previous pull attempt was refunded",
+            },
+        )
+    if operation.status == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": operation.error_code or "pull_failed",
+                "message": operation.error_message or "previous pull attempt failed",
+            },
+        )
+    raise state_store_http_exception("pull outcome is being reconciled")
+
+
+async def publish_and_complete_claimed_pull(
+    *,
+    services: AppServices,
+    operation_key: str,
+    request_hash: str,
+    response: PullResponse,
+    event: PullCompletedEvent,
+) -> PullResponse:
+    try:
+        await publish_pull_completed_with_retry(services.event_publisher, event)
+    except EventPublishError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "kafka_unavailable",
+                "message": "pull event could not be published",
+            },
+        ) from exc
+
+    try:
+        await services.state_store.save_pull_operation_by_key(
+            operation_key=operation_key,
             operation=PullOperation(
                 status="succeeded",
                 request_hash=request_hash,
@@ -597,8 +687,55 @@ def register_routes(app: FastAPI) -> None:
                 event=event,
             ),
         )
+    except GachaStateStoreError:
+        LOGGER.warning("failed to save pull operation status", exc_info=True)
+    return response
 
-        return response
+
+async def refund_claimed_spend(
+    *,
+    services: AppServices,
+    user_id: UUID,
+    operation_key: str,
+    request_hash: str,
+    context: PullRecoveryContext,
+    metadata: dict[str, object],
+    code: str,
+    message: str,
+) -> None:
+    try:
+        await services.asset_client.credit(
+            user_id=user_id,
+            amount_minor=context.amount_minor,
+            idempotency_key=refund_idempotency_key(str(context.event_id)),
+            reason="gacha_pull_refund",
+            metadata={**metadata, "refund_reason": code},
+            request_id=context.request_id,
+        )
+    except AssetServiceError as exc:
+        LOGGER.warning(
+            "asset refund failed request_id=%s status=%s code=%s",
+            context.request_id,
+            exc.status_code,
+            exc.code,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "asset_refund_unavailable",
+                "message": "asset refund could not be completed",
+            },
+        ) from exc
+
+    await services.state_store.save_pull_operation_by_key(
+        operation_key=operation_key,
+        operation=PullOperation(
+            status="failed",
+            request_hash=request_hash,
+            error_code=code,
+            error_message=message,
+        ),
+    )
 
 
 def create_catalog_repository(settings: Settings) -> CatalogRepository:
@@ -832,6 +969,72 @@ async def save_pull_operation_best_effort(
         LOGGER.warning("failed to save pull operation status", exc_info=True)
 
 
+async def recover_expired_processing_pulls_once(
+    services: AppServices,
+    *,
+    limit: int,
+    processing_lease_seconds: int,
+) -> int:
+    try:
+        records = await services.state_store.iter_expired_processing_pull_operations(
+            limit=limit,
+        )
+    except GachaStateStoreError:
+        LOGGER.warning("failed to scan expired processing pulls", exc_info=True)
+        return 0
+
+    recovered_count = 0
+    for record in records:
+        if (
+            record.operation.status != "processing"
+            or record.operation.recovery_context is None
+        ):
+            continue
+
+        try:
+            claim = await services.state_store.claim_expired_processing_pull_operation(
+                operation_key=record.operation_key,
+                processing_lease_seconds=processing_lease_seconds,
+            )
+        except GachaStateStoreError:
+            LOGGER.warning(
+                "failed to claim expired processing pull operation_key=%s",
+                record.operation_key,
+                exc_info=True,
+            )
+            continue
+
+        if claim is None or claim.operation.recovery_context is None:
+            continue
+
+        event_id = str(claim.operation.recovery_context.event_id)
+        try:
+            await execute_claimed_pull(
+                services=services,
+                user_id=claim.user_id,
+                operation_key=claim.operation_key,
+                request_hash=claim.operation.request_hash,
+                processing_token=claim.processing_token,
+                context=claim.operation.recovery_context,
+            )
+            recovered_count += 1
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            LOGGER.warning(
+                "expired processing pull recovery deferred event_id=%s status=%s code=%s",
+                event_id,
+                exc.status_code,
+                detail.get("code", "recovery_failed"),
+            )
+        except Exception:
+            LOGGER.exception(
+                "unexpected expired processing pull recovery failure event_id=%s",
+                event_id,
+            )
+
+    return recovered_count
+
+
 async def run_pending_event_recovery_worker(
     *,
     services: AppServices,
@@ -842,7 +1045,12 @@ async def run_pending_event_recovery_worker(
     while True:
         await asyncio.sleep(max(1, interval_seconds))
         try:
-            recovered_count = await recover_pending_pull_events_once(
+            recovered_processing_count = await recover_expired_processing_pulls_once(
+                services,
+                limit=batch_size,
+                processing_lease_seconds=PULL_PROCESSING_LEASE_SECONDS,
+            )
+            recovered_event_count = await recover_pending_pull_events_once(
                 services,
                 limit=batch_size,
                 lock_ttl_seconds=lock_ttl_seconds,
@@ -853,8 +1061,13 @@ async def run_pending_event_recovery_worker(
             LOGGER.exception("pending pull event recovery worker failed")
             continue
 
-        if recovered_count:
-            LOGGER.info("recovered pending pull events count=%s", recovered_count)
+        if recovered_processing_count:
+            LOGGER.info(
+                "recovered expired processing pulls count=%s",
+                recovered_processing_count,
+            )
+        if recovered_event_count:
+            LOGGER.info("recovered pending pull events count=%s", recovered_event_count)
 
 
 async def recover_pending_pull_events_once(

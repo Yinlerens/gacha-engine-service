@@ -9,7 +9,13 @@ import uuid
 from uuid import UUID
 
 from .engine import create_initial_pity
-from .pull_operations import PullOperation, PullOperationClaim, PullOperationRecord
+from .pull_operations import (
+    PullOperation,
+    PullOperationClaim,
+    PullOperationRecord,
+    PullOperationRecoveryClaim,
+    PullRecoveryContext,
+)
 from .schemas import PitySnapshot, PityState
 from .state_store import (
     GachaStateStoreError,
@@ -109,6 +115,7 @@ class PostgresGachaStateStore:
         idempotency_key: str,
         request_hash: str,
         processing_lease_seconds: int,
+        recovery_context: PullRecoveryContext,
     ) -> PullOperationClaim:
         pool = await self._ensure_pool()
         key_hash = _idempotency_key_hash(idempotency_key)
@@ -124,9 +131,11 @@ class PostgresGachaStateStore:
                     request_hash,
                     processing_token,
                     lease_seconds,
+                    _model_json(recovery_context),
                 )
                 if created is not None:
                     return PullOperationClaim(
+                        operation_key=str(created["id"]),
                         operation=_operation_from_row(created),
                         processing_token=processing_token,
                     )
@@ -141,6 +150,7 @@ class PostgresGachaStateStore:
                 )
                 if claimed is not None:
                     return PullOperationClaim(
+                        operation_key=str(claimed["id"]),
                         operation=_operation_from_row(claimed),
                         processing_token=processing_token,
                     )
@@ -148,7 +158,11 @@ class PostgresGachaStateStore:
                 existing = await _get_pull_operation(connection, user_id, key_hash)
                 if existing is None:
                     raise GachaStateStoreError("pull operation disappeared during claim")
-                return PullOperationClaim(operation=existing)
+                operation_key, operation = existing
+                return PullOperationClaim(
+                    operation_key=operation_key,
+                    operation=operation,
+                )
         except GachaStateStoreError:
             raise
         except Exception as exc:
@@ -164,16 +178,30 @@ class PostgresGachaStateStore:
         key_hash = _idempotency_key_hash(idempotency_key)
         try:
             async with pool.acquire() as connection:
-                return await _get_pull_operation(connection, user_id, key_hash)
+                existing = await _get_pull_operation(connection, user_id, key_hash)
+                return existing[1] if existing is not None else None
         except Exception as exc:
             raise GachaStateStoreError("read pull operation from postgres failed") from exc
+
+    async def get_pull_operation_by_key(self, *, operation_key: str) -> PullOperation | None:
+        operation_id = _operation_id(operation_key)
+        pool = await self._ensure_pool()
+        try:
+            async with pool.acquire() as connection:
+                row = await connection.fetchrow(
+                    SELECT_PULL_OPERATION_BY_ID_SQL,
+                    operation_id,
+                )
+                return _operation_from_row(row) if row is not None else None
+        except Exception as exc:
+            raise GachaStateStoreError("read pull operation by key failed") from exc
 
     async def compare_and_set_with_pull_operation(
         self,
         *,
+        operation_key: str,
         user_id: UUID,
         banner_id: str,
-        idempotency_key: str,
         request_hash: str,
         expected_version: int,
         next_pity: PityState,
@@ -181,14 +209,14 @@ class PostgresGachaStateStore:
         processing_token: UUID,
     ) -> PitySnapshot:
         pool = await self._ensure_pool()
-        key_hash = _idempotency_key_hash(idempotency_key)
+        operation_id = _operation_id(operation_key)
         try:
             async with pool.acquire() as connection:
                 async with connection.transaction():
                     current_operation = await connection.fetchrow(
-                        SELECT_PULL_OPERATION_FOR_UPDATE_SQL,
+                        SELECT_PULL_OPERATION_BY_ID_FOR_UPDATE_SQL,
+                        operation_id,
                         user_id,
-                        key_hash,
                     )
                     if current_operation is None:
                         raise GachaStateStoreError("pull operation was not found during commit")
@@ -223,6 +251,7 @@ class PostgresGachaStateStore:
                         _model_json(operation.event),
                         operation.error_code,
                         operation.error_message,
+                        _model_json(operation.recovery_context),
                     )
                     if update_result != "UPDATE 1":
                         raise GachaStateStoreError("pull operation could not be committed")
@@ -235,20 +264,20 @@ class PostgresGachaStateStore:
     async def transition_pull_operation_from_processing(
         self,
         *,
+        operation_key: str,
         user_id: UUID,
-        idempotency_key: str,
         request_hash: str,
         processing_token: UUID,
         operation: PullOperation,
     ) -> None:
         pool = await self._ensure_pool()
-        key_hash = _idempotency_key_hash(idempotency_key)
+        operation_id = _operation_id(operation_key)
         try:
             async with pool.acquire() as connection:
                 row = await connection.fetchrow(
                     TRANSITION_PROCESSING_OPERATION_SQL,
+                    operation_id,
                     user_id,
-                    key_hash,
                     request_hash,
                     processing_token,
                     operation.status,
@@ -256,6 +285,7 @@ class PostgresGachaStateStore:
                     _model_json(operation.event),
                     operation.error_code,
                     operation.error_message,
+                    _model_json(operation.recovery_context),
                 )
                 if row is None:
                     raise PullOperationOwnershipLost()
@@ -285,6 +315,7 @@ class PostgresGachaStateStore:
                     _model_json(operation.event),
                     operation.error_code,
                     operation.error_message,
+                    _model_json(operation.recovery_context),
                 )
                 if result != "UPDATE 1":
                     raise GachaStateStoreError("pull operation was not found during save")
@@ -304,10 +335,64 @@ class PostgresGachaStateStore:
         return [
             PullOperationRecord(
                 operation_key=str(row["id"]),
+                user_id=row["user_id"],
                 operation=_operation_from_row(row),
             )
             for row in rows
         ]
+
+    async def iter_expired_processing_pull_operations(
+        self,
+        *,
+        limit: int,
+    ) -> list[PullOperationRecord]:
+        pool = await self._ensure_pool()
+        try:
+            async with pool.acquire() as connection:
+                rows = await connection.fetch(
+                    SELECT_EXPIRED_PROCESSING_OPERATIONS_SQL,
+                    max(1, limit),
+                )
+        except Exception as exc:
+            raise GachaStateStoreError("list expired processing pulls failed") from exc
+
+        return [
+            PullOperationRecord(
+                operation_key=str(row["id"]),
+                user_id=row["user_id"],
+                operation=_operation_from_row(row),
+            )
+            for row in rows
+        ]
+
+    async def claim_expired_processing_pull_operation(
+        self,
+        *,
+        operation_key: str,
+        processing_lease_seconds: int,
+    ) -> PullOperationRecoveryClaim | None:
+        operation_id = _operation_id(operation_key)
+        processing_token = uuid.uuid4()
+        pool = await self._ensure_pool()
+        try:
+            async with pool.acquire() as connection:
+                row = await connection.fetchrow(
+                    CLAIM_EXPIRED_PROCESSING_OPERATION_SQL,
+                    operation_id,
+                    processing_token,
+                    max(1, processing_lease_seconds),
+                )
+        except Exception as exc:
+            raise GachaStateStoreError("claim expired processing pull failed") from exc
+
+        if row is None:
+            return None
+        return PullOperationRecoveryClaim(
+            operation_key=str(row["id"]),
+            user_id=row["user_id"],
+            operation=_operation_from_row(row),
+            processing_token=processing_token,
+        )
 
     async def claim_pull_operation_recovery(
         self,
@@ -355,6 +440,7 @@ class PostgresGachaStateStore:
                     _model_json(operation.event),
                     operation.error_code,
                     operation.error_message,
+                    _model_json(operation.recovery_context),
                 )
                 if result != "UPDATE 1":
                     raise GachaStateStoreError("pending pull operation was not found")
@@ -389,9 +475,11 @@ async def _get_pull_operation(
     connection: Any,
     user_id: UUID,
     key_hash: str,
-) -> PullOperation | None:
+) -> tuple[str, PullOperation] | None:
     row = await connection.fetchrow(SELECT_PULL_OPERATION_SQL, user_id, key_hash)
-    return _operation_from_row(row) if row is not None else None
+    if row is None:
+        return None
+    return str(row["id"]), _operation_from_row(row)
 
 
 async def _ensure_initial_pity(connection: Any, user_id: UUID, banner_id: str) -> None:
@@ -432,6 +520,7 @@ def _snapshot_from_row(row: Any) -> PitySnapshot:
 
 
 def _operation_from_row(row: Any) -> PullOperation:
+    raw_recovery_context = _json_value(row["recovery_context"])
     return PullOperation(
         status=str(row["status"]),
         request_hash=str(row["request_hash"]),
@@ -439,6 +528,11 @@ def _operation_from_row(row: Any) -> PullOperation:
         event=_json_value(row["event"]),
         error_code=row["error_code"],
         error_message=row["error_message"],
+        recovery_context=(
+            PullRecoveryContext.model_validate(raw_recovery_context)
+            if raw_recovery_context is not None
+            else None
+        ),
     )
 
 
@@ -497,15 +591,15 @@ where user_id = $1 and banner_id = $2
 INSERT_PULL_OPERATION_SQL = """
 insert into gacha_runtime.pull_operations (
   id, user_id, idempotency_key_hash, request_hash, status,
-  processing_token, processing_lease_until
+  processing_token, processing_lease_until, recovery_context
 )
 values (
   $1, $2, $3, $4, 'processing', $5,
-  now() + make_interval(secs => $6)
+  now() + make_interval(secs => $6), $7::jsonb
 )
 on conflict (user_id, idempotency_key_hash) do nothing
-returning id, status, request_hash, response, event, error_code, error_message,
-          processing_token
+returning id, user_id, status, request_hash, response, event, error_code,
+          error_message, processing_token, recovery_context
 """
 
 CLAIM_PROCESSING_OPERATION_SQL = """
@@ -518,22 +612,29 @@ where user_id = $1
   and request_hash = $3
   and status = 'processing'
   and (processing_lease_until is null or processing_lease_until < now())
-returning id, status, request_hash, response, event, error_code, error_message,
-          processing_token
+returning id, user_id, status, request_hash, response, event, error_code,
+          error_message, processing_token, recovery_context
 """
 
 SELECT_PULL_OPERATION_SQL = """
-select id, status, request_hash, response, event, error_code, error_message,
-       processing_token
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context
 from gacha_runtime.pull_operations
 where user_id = $1 and idempotency_key_hash = $2
 """
 
-SELECT_PULL_OPERATION_FOR_UPDATE_SQL = """
-select id, status, request_hash, response, event, error_code, error_message,
-       processing_token
+SELECT_PULL_OPERATION_BY_ID_SQL = """
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context
 from gacha_runtime.pull_operations
-where user_id = $1 and idempotency_key_hash = $2
+where id = $1
+"""
+
+SELECT_PULL_OPERATION_BY_ID_FOR_UPDATE_SQL = """
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context
+from gacha_runtime.pull_operations
+where id = $1 and user_id = $2
 for update
 """
 
@@ -544,6 +645,7 @@ set status = $2,
     event = $4::jsonb,
     error_code = $5,
     error_message = $6,
+    recovery_context = $7::jsonb,
     recovery_locked_until = null,
     processing_token = null,
     processing_lease_until = null,
@@ -558,11 +660,12 @@ set status = $5,
     event = $7::jsonb,
     error_code = $8,
     error_message = $9,
+    recovery_context = $10::jsonb,
     processing_token = null,
     processing_lease_until = null,
     updated_at = now()
-where user_id = $1
-  and idempotency_key_hash = $2
+where id = $1
+  and user_id = $2
   and request_hash = $3
   and status = 'processing'
   and processing_token = $4
@@ -576,6 +679,7 @@ set status = $4,
     event = $6::jsonb,
     error_code = $7,
     error_message = $8,
+    recovery_context = $9::jsonb,
     recovery_locked_until = null,
     processing_token = null,
     processing_lease_until = null,
@@ -586,12 +690,36 @@ where user_id = $1
 """
 
 SELECT_PENDING_OPERATIONS_SQL = """
-select id, status, request_hash, response, event, error_code, error_message,
-       processing_token
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context
 from gacha_runtime.pull_operations
 where status = 'event_pending'
 order by updated_at, id
 limit $1
+"""
+
+SELECT_EXPIRED_PROCESSING_OPERATIONS_SQL = """
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context
+from gacha_runtime.pull_operations
+where status = 'processing'
+  and recovery_context is not null
+  and (processing_lease_until is null or processing_lease_until < now())
+order by processing_lease_until nulls first, id
+limit $1
+"""
+
+CLAIM_EXPIRED_PROCESSING_OPERATION_SQL = """
+update gacha_runtime.pull_operations
+set processing_token = $2,
+    processing_lease_until = now() + make_interval(secs => $3),
+    updated_at = now()
+where id = $1
+  and status = 'processing'
+  and recovery_context is not null
+  and (processing_lease_until is null or processing_lease_until < now())
+returning id, user_id, status, request_hash, response, event, error_code,
+          error_message, processing_token, recovery_context
 """
 
 CLAIM_PENDING_OPERATION_SQL = """

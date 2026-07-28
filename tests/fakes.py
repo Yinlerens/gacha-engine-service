@@ -11,6 +11,8 @@ from gacha_engine_service.pull_operations import (
     PullOperation,
     PullOperationClaim,
     PullOperationRecord,
+    PullOperationRecoveryClaim,
+    PullRecoveryContext,
 )
 from gacha_engine_service.state_store import (
     GachaStateStoreError,
@@ -41,6 +43,8 @@ class FakePityStateStore:
         self.ownership_lost_on_commit = ownership_lost_on_commit
         self.closed = False
         self.operations: dict[tuple[UUID, str], PullOperation] = {}
+        self.operation_ids: dict[tuple[UUID, str], str] = {}
+        self.operation_keys: dict[str, tuple[UUID, str]] = {}
         self.processing_tokens: dict[tuple[UUID, str], UUID] = {}
         self.claimable_operations: set[tuple[UUID, str]] = set()
 
@@ -79,6 +83,7 @@ class FakePityStateStore:
         idempotency_key: str,
         request_hash: str,
         processing_lease_seconds: int,
+        recovery_context: PullRecoveryContext,
     ) -> PullOperationClaim:
         if self.unavailable:
             raise GachaStateStoreError("state database is unavailable")
@@ -93,14 +98,32 @@ class FakePityStateStore:
                 token = uuid.uuid4()
                 self.processing_tokens[key] = token
                 self.claimable_operations.discard(key)
-                return PullOperationClaim(operation=operation, processing_token=token)
-            return PullOperationClaim(operation=operation)
+                return PullOperationClaim(
+                    operation_key=self.operation_ids[key],
+                    operation=operation,
+                    processing_token=token,
+                )
+            return PullOperationClaim(
+                operation_key=self.operation_ids[key],
+                operation=operation,
+            )
 
-        operation = PullOperation(status="processing", request_hash=request_hash)
+        operation = PullOperation(
+            status="processing",
+            request_hash=request_hash,
+            recovery_context=recovery_context,
+        )
+        operation_key = str(uuid.uuid4())
         token = uuid.uuid4()
         self.operations[key] = operation
+        self.operation_ids[key] = operation_key
+        self.operation_keys[operation_key] = key
         self.processing_tokens[key] = token
-        return PullOperationClaim(operation=operation, processing_token=token)
+        return PullOperationClaim(
+            operation_key=operation_key,
+            operation=operation,
+            processing_token=token,
+        )
 
     def expire_processing_lease(self, *, user_id: UUID, idempotency_key: str) -> None:
         self.claimable_operations.add((user_id, idempotency_key))
@@ -115,19 +138,25 @@ class FakePityStateStore:
             raise GachaStateStoreError("state database is unavailable")
         return self.operations.get((user_id, idempotency_key))
 
+    async def get_pull_operation_by_key(self, *, operation_key: str) -> PullOperation | None:
+        key = self.operation_keys.get(operation_key)
+        return self.operations.get(key) if key is not None else None
+
     async def compare_and_set_with_pull_operation(
         self,
         *,
+        operation_key: str,
         user_id: UUID,
         banner_id: str,
-        idempotency_key: str,
         request_hash: str,
         expected_version: int,
         next_pity: PityState,
         operation: PullOperation,
         processing_token: UUID,
     ) -> PitySnapshot:
-        key = (user_id, idempotency_key)
+        key = self.operation_keys[operation_key]
+        if key[0] != user_id:
+            raise PullOperationOwnershipLost()
         if self.ownership_lost_on_commit or self.processing_tokens.get(key) != processing_token:
             raise PullOperationOwnershipLost()
         if self.commit_unavailable:
@@ -147,13 +176,15 @@ class FakePityStateStore:
     async def transition_pull_operation_from_processing(
         self,
         *,
+        operation_key: str,
         user_id: UUID,
-        idempotency_key: str,
         request_hash: str,
         processing_token: UUID,
         operation: PullOperation,
     ) -> None:
-        key = (user_id, idempotency_key)
+        key = self.operation_keys[operation_key]
+        if key[0] != user_id:
+            raise PullOperationOwnershipLost()
         current = self.operations.get(key)
         if (
             current is None
@@ -181,13 +212,57 @@ class FakePityStateStore:
                 continue
             records.append(
                 PullOperationRecord(
-                    operation_key=f"{user_id}:{idempotency_key}",
+                    operation_key=self.operation_ids[(user_id, idempotency_key)],
+                    user_id=user_id,
                     operation=operation,
                 )
             )
             if len(records) >= limit:
                 break
         return records
+
+    async def iter_expired_processing_pull_operations(
+        self,
+        *,
+        limit: int,
+    ) -> list[PullOperationRecord]:
+        records: list[PullOperationRecord] = []
+        for key in self.claimable_operations:
+            operation = self.operations[key]
+            if operation.status != "processing" or operation.recovery_context is None:
+                continue
+            records.append(
+                PullOperationRecord(
+                    operation_key=self.operation_ids[key],
+                    user_id=key[0],
+                    operation=operation,
+                )
+            )
+            if len(records) >= limit:
+                break
+        return records
+
+    async def claim_expired_processing_pull_operation(
+        self,
+        *,
+        operation_key: str,
+        processing_lease_seconds: int,
+    ) -> PullOperationRecoveryClaim | None:
+        key = self.operation_keys.get(operation_key)
+        if key is None or key not in self.claimable_operations:
+            return None
+        operation = self.operations[key]
+        if operation.status != "processing" or operation.recovery_context is None:
+            return None
+        token = uuid.uuid4()
+        self.processing_tokens[key] = token
+        self.claimable_operations.discard(key)
+        return PullOperationRecoveryClaim(
+            operation_key=operation_key,
+            user_id=key[0],
+            operation=operation,
+            processing_token=token,
+        )
 
     async def claim_pull_operation_recovery(
         self,
@@ -206,8 +281,7 @@ class FakePityStateStore:
         operation_key: str,
         operation: PullOperation,
     ) -> None:
-        user_id, idempotency_key = operation_key.split(":", 1)
-        self.operations[(UUID(user_id), idempotency_key)] = operation
+        self.operations[self.operation_keys[operation_key]] = operation
 
 
 class FakeEventPublisher:
