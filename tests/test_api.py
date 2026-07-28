@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -92,6 +93,62 @@ class EmptyCatalogRepository:
 
     async def close(self) -> None:
         return None
+
+
+class FixedCatalogRepository:
+    def __init__(self, snapshot: CatalogSnapshot) -> None:
+        self.snapshot = snapshot
+
+    async def load_snapshot(self) -> CatalogSnapshot:
+        return self.snapshot
+
+    async def close(self) -> None:
+        return None
+
+
+def grouped_catalog_snapshot() -> CatalogSnapshot:
+    snapshot = static_catalog_snapshot()
+    limited_config = snapshot.banner_configs_by_id["limited-character-001"]
+    standard_config = snapshot.banner_configs_by_id["standard-001"]
+    next_limited_banner = limited_config.banner.model_copy(
+        update={
+            "id": "limited-character-002",
+            "name": "归潮观测·续期",
+        }
+    )
+    shared_group_id = "limited-character-shared"
+    first_limited = replace(
+        limited_config,
+        banner_version_id="11111111-1111-4111-8111-111111111111",
+        version=1,
+        pity_group_id=shared_group_id,
+    )
+    next_limited = replace(
+        limited_config,
+        banner=next_limited_banner,
+        banner_version_id="22222222-2222-4222-8222-222222222222",
+        version=2,
+        pity_group_id=shared_group_id,
+    )
+    isolated_standard = replace(
+        standard_config,
+        pity_group_id="standard-isolated",
+    )
+    return CatalogSnapshot(
+        source="test",
+        loaded_at=datetime.now(timezone.utc),
+        items=snapshot.items,
+        banners=(
+            first_limited.banner,
+            next_limited.banner,
+            isolated_standard.banner,
+        ),
+        banner_configs_by_id={
+            first_limited.banner.id: first_limited,
+            next_limited.banner.id: next_limited,
+            isolated_standard.banner.id: isolated_standard,
+        },
+    )
 
 
 class ApiTests(unittest.TestCase):
@@ -389,6 +446,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["seed"], "api-seed")
+        self.assertEqual(payload["pity_group_id"], "limited-character-001")
         self.assertEqual(payload["previous_pity"]["version"], 0)
         self.assertEqual(payload["next_pity"]["version"], 1)
         self.assertEqual(payload["state_version"], 1)
@@ -405,6 +463,7 @@ class ApiTests(unittest.TestCase):
         event = event_publisher.events[0]
         self.assertEqual(event.user_id, USER_ID)
         self.assertEqual(event.banner_id, "limited-character-001")
+        self.assertEqual(event.pity_group_id, "limited-character-001")
         self.assertEqual(event.seed, "api-seed")
         self.assertEqual(event.state_version, 1)
         self.assertEqual(event.records, event_publisher.events[0].records)
@@ -565,6 +624,51 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.spends), 2)
         self.assertEqual(asset_client.credits, [])
         self.assertEqual(len(event_publisher.events), 2)
+
+    def test_pity_group_is_shared_across_banner_versions_and_isolated_from_other_groups(self) -> None:
+        catalog = grouped_catalog_snapshot()
+        client, state_store, event_publisher, _ = make_client(
+            catalog_repository=FixedCatalogRepository(catalog),
+        )
+
+        first = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1, "seed": "group-v1"},
+            headers=HEADERS | {"Idempotency-Key": "group-v1"},
+        )
+        next_version = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-002", "count": 1, "seed": "group-v2"},
+            headers=HEADERS | {"Idempotency-Key": "group-v2"},
+        )
+        isolated = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "standard-001", "count": 1, "seed": "isolated"},
+            headers=HEADERS | {"Idempotency-Key": "group-isolated"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(next_version.status_code, 200)
+        self.assertEqual(isolated.status_code, 200)
+        self.assertEqual(first.json()["previous_pity"]["version"], 0)
+        self.assertEqual(next_version.json()["previous_pity"]["version"], 1)
+        self.assertEqual(isolated.json()["previous_pity"]["version"], 0)
+        self.assertEqual(
+            state_store.snapshot_writes,
+            [
+                "limited-character-shared",
+                "limited-character-shared",
+                "standard-isolated",
+            ],
+        )
+        self.assertEqual(
+            [event.pity_group_id for event in event_publisher.events],
+            [
+                "limited-character-shared",
+                "limited-character-shared",
+                "standard-isolated",
+            ],
+        )
 
     def test_refund_is_persisted_before_asset_credit(self) -> None:
         state_store = FakePityStateStore()
@@ -911,6 +1015,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["version"], 0)
         self.assertEqual(response.json()["since_five"], 0)
+
+    def test_get_pity_resolves_the_banner_to_its_pity_group(self) -> None:
+        catalog = grouped_catalog_snapshot()
+        client, state_store, _, _ = make_client(
+            catalog_repository=FixedCatalogRepository(catalog),
+        )
+
+        response = client.get(
+            "/v1/me/pity?banner_id=limited-character-002",
+            headers=HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(state_store.snapshot_reads, ["limited-character-shared"])
 
 
 if __name__ == "__main__":

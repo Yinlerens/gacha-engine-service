@@ -130,6 +130,18 @@ def recovery_context() -> PullRecoveryContext:
 
 
 class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_recovery_context_round_trip_freezes_the_pity_group(self) -> None:
+        context = recovery_context()
+
+        restored = PullRecoveryContext.model_validate_json(context.model_dump_json())
+
+        self.assertEqual(context.pity_group_id, "limited-character-001")
+        self.assertEqual(restored.pity_group_id, context.pity_group_id)
+        self.assertEqual(
+            restored.to_banner_config().pity_group_id,
+            context.pity_group_id,
+        )
+
     async def test_begin_pull_operation_creates_a_durable_fenced_lease(self) -> None:
         context = recovery_context()
         connection = FakeConnection(
@@ -288,6 +300,17 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gacha_runtime.pity_snapshots", executed_sql)
         self.assertIn("gacha_runtime.pull_operations", executed_sql)
 
+    async def test_pity_queries_use_the_explicit_group_key(self) -> None:
+        connection = FakeConnection(fetchrow_results=[None])
+        store = make_store(connection)
+
+        snapshot = await store.get_snapshot(USER_ID, "limited-character-shared")
+
+        self.assertEqual(snapshot.version, 0)
+        select_call = connection.fetchrow_calls[0]
+        self.assertIn("pity_group_id = $2", str(select_call[0]).lower())
+        self.assertEqual(select_call[2], "limited-character-shared")
+
     async def test_stale_processing_owner_is_fenced_before_pity_commit(self) -> None:
         connection = FakeConnection(fetchrow_results=[operation_row()])
         store = make_store(connection)
@@ -342,6 +365,28 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("create index concurrently", normalized)
         self.assertIn("status = 'refund_pending'", normalized)
         self.assertNotIn("recovery_context jsonb not null", normalized)
+
+    def test_pity_group_migrations_preserve_legacy_rows_before_enforcing_uniqueness(self) -> None:
+        migrations = Path(__file__).parents[1] / "migrations"
+        expand = (migrations / "000004_pity_groups_expand.up.sql").read_text(
+            encoding="utf-8"
+        ).lower()
+        backfill = (migrations / "000005_backfill_pity_groups.up.sql").read_text(
+            encoding="utf-8"
+        ).lower()
+        enforce = (migrations / "000006_pity_groups_enforce.up.sql").read_text(
+            encoding="utf-8"
+        ).lower()
+
+        self.assertIn("add column if not exists pity_group_id text", expand)
+        self.assertIn("new.pity_group_id := new.banner_id", expand)
+        self.assertIn("set pity_group_id = banner_id", backfill)
+        self.assertIn("where pity_group_id is null", backfill)
+        self.assertIn("create unique index concurrently", enforce)
+        self.assertIn("(user_id, pity_group_id)", enforce)
+        self.assertIn("validate constraint pity_snapshots_pity_group_id_length", enforce)
+        for version in ("000004", "000005", "000006"):
+            self.assertTrue(any(migrations.glob(f"{version}_*.down.sql")))
 
 
 if __name__ == "__main__":

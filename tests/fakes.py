@@ -36,7 +36,14 @@ class FakePityStateStore:
         ownership_lost_on_commit: bool = False,
         synchronized_snapshot_readers: int = 0,
     ) -> None:
-        self.snapshot = snapshot or PitySnapshot(**create_initial_pity().model_dump(), version=0)
+        self.initial_snapshot = snapshot or PitySnapshot(
+            **create_initial_pity().model_dump(),
+            version=0,
+        )
+        self.snapshot = self.initial_snapshot
+        self.snapshots: dict[str, PitySnapshot] = {}
+        self.snapshot_reads: list[str] = []
+        self.snapshot_writes: list[str] = []
         self.ping_error = ping_error
         self.conflict = conflict
         self.unavailable = unavailable
@@ -64,10 +71,11 @@ class FakePityStateStore:
         if self.ping_error:
             raise GachaStateStoreError("state database is unavailable")
 
-    async def get_snapshot(self, user_id: UUID, banner_id: str) -> PitySnapshot:
+    async def get_snapshot(self, user_id: UUID, pity_group_id: str) -> PitySnapshot:
         if self.unavailable:
             raise GachaStateStoreError("state database is unavailable")
-        snapshot = self.snapshot
+        self.snapshot_reads.append(pity_group_id)
+        snapshot = self.snapshots.get(pity_group_id, self.initial_snapshot)
         if (
             self.snapshot_read_barrier is not None
             and self.synchronized_snapshot_reads_remaining > 0
@@ -80,16 +88,19 @@ class FakePityStateStore:
         self,
         *,
         user_id: UUID,
-        banner_id: str,
+        pity_group_id: str,
         expected_version: int,
         next_pity: PityState,
     ) -> PitySnapshot:
         if self.unavailable:
             raise GachaStateStoreError("state database is unavailable")
-        if self.conflict or self.snapshot.version != expected_version:
-            raise PityVersionConflict(current_version=self.snapshot.version)
+        current_snapshot = self.snapshots.get(pity_group_id, self.initial_snapshot)
+        if self.conflict or current_snapshot.version != expected_version:
+            raise PityVersionConflict(current_version=current_snapshot.version)
 
         self.snapshot = PitySnapshot(**next_pity.model_dump(), version=expected_version + 1)
+        self.snapshots[pity_group_id] = self.snapshot
+        self.snapshot_writes.append(pity_group_id)
         return self.snapshot
 
     async def begin_pull_operation(
@@ -163,7 +174,7 @@ class FakePityStateStore:
         *,
         operation_key: str,
         user_id: UUID,
-        banner_id: str,
+        pity_group_id: str,
         request_hash: str,
         expected_version: int,
         next_pity: PityState,
@@ -179,7 +190,7 @@ class FakePityStateStore:
             raise GachaStateStoreError("state database is unavailable during commit")
         next_snapshot = await self.compare_and_set(
             user_id=user_id,
-            banner_id=banner_id,
+            pity_group_id=pity_group_id,
             expected_version=expected_version,
             next_pity=next_pity,
         )

@@ -91,6 +91,7 @@ class CatalogRepositoryTests(unittest.TestCase):
                 "banners": [
                     {
                         "id": "banner",
+                        "pity_group_id": "limited-character-shared",
                         "name": "Banner",
                         "short_name": "Banner",
                         "banner_type": "standard",
@@ -190,6 +191,10 @@ class CatalogRepositoryTests(unittest.TestCase):
         self.assertEqual(
             snapshot.banner_configs_by_id["banner"].banner_version_id,
             active_version_id,
+        )
+        self.assertEqual(
+            snapshot.banner_configs_by_id["banner"].pity_group_id,
+            "limited-character-shared",
         )
 
     def test_build_snapshot_from_release_rejects_invalid_checksum(self) -> None:
@@ -319,6 +324,7 @@ class CatalogRepositoryTests(unittest.TestCase):
 
         self.assertEqual(snapshot.source, "postgres")
         self.assertEqual(banner_config.version, 7)
+        self.assertEqual(banner_config.pity_group_id, "banner-1")
         self.assertEqual(banner_config.banner.featured_five_id, "char-up")
         self.assertEqual(banner_config.rarity_rates[5].base_rate, 1.0)
 
