@@ -15,6 +15,7 @@ from gacha_engine_service.main import (
     create_app,
     recover_expired_processing_pulls_once,
     recover_pending_pull_events_once,
+    recover_pending_pull_refunds_once,
 )
 from gacha_engine_service.postgres_state import PostgresGachaStateStore
 from gacha_engine_service.pull_operations import PullOperation
@@ -506,6 +507,91 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(status_during_credit, ["refund_pending"])
+
+    def test_pending_refund_recovers_without_another_client_request(self) -> None:
+        state_store = FakePityStateStore(conflict=True)
+        asset_client = FakeAssetClient(
+            credit_error=AssetServiceError(
+                503,
+                "asset_unavailable",
+                "asset service timed out",
+            )
+        )
+        client, state_store, event_publisher, asset_client = make_client(
+            state_store=state_store,
+            asset_client=asset_client,
+        )
+
+        first = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1, "seed": "refund-recovery"},
+            headers=HEADERS,
+        )
+        asset_client.credit_error = None
+        services = AppServices(state_store, event_publisher, object(), asset_client)
+
+        first_recovery = asyncio.run(
+            recover_pending_pull_refunds_once(
+                services,
+                limit=10,
+                lock_ttl_seconds=30,
+            )
+        )
+        second_recovery = asyncio.run(
+            recover_pending_pull_refunds_once(
+                services,
+                limit=10,
+                lock_ttl_seconds=30,
+            )
+        )
+
+        self.assertEqual(first.status_code, 503)
+        self.assertEqual(first_recovery, 1)
+        self.assertEqual(second_recovery, 0)
+        self.assertEqual(len(asset_client.spends), 1)
+        self.assertEqual(len(asset_client.credits), 1)
+        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        self.assertEqual(operation.status, "failed")
+        self.assertIsNone(operation.recovery_context)
+
+    def test_two_refund_workers_only_complete_one_refund(self) -> None:
+        state_store = FakePityStateStore(conflict=True)
+        asset_client = FakeAssetClient(
+            credit_error=AssetServiceError(503, "asset_unavailable", "temporary outage")
+        )
+        client, state_store, event_publisher, asset_client = make_client(
+            state_store=state_store,
+            asset_client=asset_client,
+        )
+        first = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1, "seed": "refund-race"},
+            headers=HEADERS,
+        )
+        asset_client.credit_error = None
+        services = AppServices(state_store, event_publisher, object(), asset_client)
+
+        async def recover_concurrently() -> list[int]:
+            return list(
+                await asyncio.gather(
+                    recover_pending_pull_refunds_once(
+                        services,
+                        limit=10,
+                        lock_ttl_seconds=30,
+                    ),
+                    recover_pending_pull_refunds_once(
+                        services,
+                        limit=10,
+                        lock_ttl_seconds=30,
+                    ),
+                )
+            )
+
+        recovered_counts = asyncio.run(recover_concurrently())
+
+        self.assertEqual(first.status_code, 503)
+        self.assertEqual(sum(recovered_counts), 1)
+        self.assertEqual(len(asset_client.credits), 1)
 
     def test_uncertain_state_commit_never_triggers_a_refund(self) -> None:
         state_store = FakePityStateStore(commit_unavailable=True)

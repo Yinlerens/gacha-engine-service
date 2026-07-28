@@ -47,6 +47,7 @@ class FakePityStateStore:
         self.operation_keys: dict[str, tuple[UUID, str]] = {}
         self.processing_tokens: dict[tuple[UUID, str], UUID] = {}
         self.claimable_operations: set[tuple[UUID, str]] = set()
+        self.recovery_locks: set[str] = set()
 
     async def close(self) -> None:
         self.closed = True
@@ -221,6 +222,22 @@ class FakePityStateStore:
                 break
         return records
 
+    async def iter_refund_pending_pull_operations(self, *, limit: int) -> list[PullOperationRecord]:
+        records: list[PullOperationRecord] = []
+        for (user_id, idempotency_key), operation in self.operations.items():
+            if operation.status != "refund_pending" or operation.recovery_context is None:
+                continue
+            records.append(
+                PullOperationRecord(
+                    operation_key=self.operation_ids[(user_id, idempotency_key)],
+                    user_id=user_id,
+                    operation=operation,
+                )
+            )
+            if len(records) >= limit:
+                break
+        return records
+
     async def iter_expired_processing_pull_operations(
         self,
         *,
@@ -268,12 +285,19 @@ class FakePityStateStore:
         self,
         *,
         operation_key: str,
+        expected_status: str,
         lock_ttl_seconds: int,
     ) -> bool:
+        key = self.operation_keys.get(operation_key)
+        if key is None or operation_key in self.recovery_locks:
+            return False
+        if self.operations[key].status != expected_status:
+            return False
+        self.recovery_locks.add(operation_key)
         return True
 
     async def release_pull_operation_recovery(self, *, operation_key: str) -> None:
-        return None
+        self.recovery_locks.discard(operation_key)
 
     async def save_pull_operation_by_key(
         self,

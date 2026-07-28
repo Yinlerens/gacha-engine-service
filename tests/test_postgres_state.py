@@ -205,7 +205,36 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(claim.processing_token)
         self.assertEqual(claim.operation.status, "processing")
-        self.assertIn("processing_lease_until < now()", str(connection.fetchrow_calls[1][0]))
+        claim_call = connection.fetchrow_calls[1]
+        self.assertIn("processing_lease_until < now()", str(claim_call[0]))
+        self.assertIn("coalesce(recovery_context", str(claim_call[0]).lower())
+        self.assertEqual(claim_call[-1], context.model_dump_json())
+
+    async def test_recovery_lock_claims_only_the_expected_status_once(self) -> None:
+        connection = FakeConnection(
+            fetchrow_results=[
+                operation_row(status="refund_pending"),
+                None,
+            ]
+        )
+        store = make_store(connection)
+
+        first = await store.claim_pull_operation_recovery(
+            operation_key=str(OPERATION_ID),
+            expected_status="refund_pending",
+            lock_ttl_seconds=30,
+        )
+        second = await store.claim_pull_operation_recovery(
+            operation_key=str(OPERATION_ID),
+            expected_status="refund_pending",
+            lock_ttl_seconds=30,
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        claim_call = connection.fetchrow_calls[0]
+        self.assertIn("status = $3", str(claim_call[0]).lower())
+        self.assertEqual(claim_call[3], "refund_pending")
 
     async def test_begin_pull_operation_does_not_take_an_active_lease(self) -> None:
         context = recovery_context()
@@ -311,6 +340,7 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("add column if not exists recovery_context jsonb", normalized)
         self.assertIn("recovery_context is not null", normalized)
         self.assertIn("create index concurrently", normalized)
+        self.assertIn("status = 'refund_pending'", normalized)
         self.assertNotIn("recovery_context jsonb not null", normalized)
 
 
