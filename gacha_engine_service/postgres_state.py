@@ -59,14 +59,14 @@ class PostgresGachaStateStore:
         except Exception as exc:
             raise GachaStateStoreError("gacha state database is unavailable") from exc
 
-    async def get_snapshot(self, user_id: UUID, banner_id: str) -> PitySnapshot:
+    async def get_snapshot(self, user_id: UUID, pity_group_id: str) -> PitySnapshot:
         pool = await self._ensure_pool()
         try:
             async with pool.acquire() as connection:
                 row = await connection.fetchrow(
                     SELECT_PITY_SQL,
                     user_id,
-                    banner_id,
+                    pity_group_id,
                 )
         except Exception as exc:
             raise GachaStateStoreError("read pity state from postgres failed") from exc
@@ -79,7 +79,7 @@ class PostgresGachaStateStore:
         self,
         *,
         user_id: UUID,
-        banner_id: str,
+        pity_group_id: str,
         expected_version: int,
         next_pity: PityState,
     ) -> PitySnapshot:
@@ -87,11 +87,11 @@ class PostgresGachaStateStore:
         try:
             async with pool.acquire() as connection:
                 async with connection.transaction():
-                    await _ensure_initial_pity(connection, user_id, banner_id)
+                    await _ensure_initial_pity(connection, user_id, pity_group_id)
                     row = await _update_pity(
                         connection,
                         user_id=user_id,
-                        banner_id=banner_id,
+                        pity_group_id=pity_group_id,
                         expected_version=expected_version,
                         next_pity=next_pity,
                     )
@@ -99,7 +99,7 @@ class PostgresGachaStateStore:
                         current_version = await _current_pity_version(
                             connection,
                             user_id,
-                            banner_id,
+                            pity_group_id,
                         )
                         raise PityVersionConflict(current_version=current_version)
                     return _snapshot_from_row(row)
@@ -202,7 +202,7 @@ class PostgresGachaStateStore:
         *,
         operation_key: str,
         user_id: UUID,
-        banner_id: str,
+        pity_group_id: str,
         request_hash: str,
         expected_version: int,
         next_pity: PityState,
@@ -228,11 +228,11 @@ class PostgresGachaStateStore:
                     if current_operation["processing_token"] != processing_token:
                         raise PullOperationOwnershipLost()
 
-                    await _ensure_initial_pity(connection, user_id, banner_id)
+                    await _ensure_initial_pity(connection, user_id, pity_group_id)
                     row = await _update_pity(
                         connection,
                         user_id=user_id,
-                        banner_id=banner_id,
+                        pity_group_id=pity_group_id,
                         expected_version=expected_version,
                         next_pity=next_pity,
                     )
@@ -240,7 +240,7 @@ class PostgresGachaStateStore:
                         current_version = await _current_pity_version(
                             connection,
                             user_id,
-                            banner_id,
+                            pity_group_id,
                         )
                         raise PityVersionConflict(current_version=current_version)
 
@@ -505,22 +505,22 @@ async def _get_pull_operation(
     return str(row["id"]), _operation_from_row(row)
 
 
-async def _ensure_initial_pity(connection: Any, user_id: UUID, banner_id: str) -> None:
-    await connection.execute(INSERT_INITIAL_PITY_SQL, user_id, banner_id)
+async def _ensure_initial_pity(connection: Any, user_id: UUID, pity_group_id: str) -> None:
+    await connection.execute(INSERT_INITIAL_PITY_SQL, user_id, pity_group_id)
 
 
 async def _update_pity(
     connection: Any,
     *,
     user_id: UUID,
-    banner_id: str,
+    pity_group_id: str,
     expected_version: int,
     next_pity: PityState,
 ) -> Any | None:
     return await connection.fetchrow(
         UPDATE_PITY_SQL,
         user_id,
-        banner_id,
+        pity_group_id,
         expected_version,
         next_pity.since_five,
         next_pity.since_four,
@@ -528,8 +528,8 @@ async def _update_pity(
     )
 
 
-async def _current_pity_version(connection: Any, user_id: UUID, banner_id: str) -> int:
-    row = await connection.fetchrow(SELECT_PITY_VERSION_SQL, user_id, banner_id)
+async def _current_pity_version(connection: Any, user_id: UUID, pity_group_id: str) -> int:
+    row = await connection.fetchrow(SELECT_PITY_VERSION_SQL, user_id, pity_group_id)
     return int(row["version"]) if row is not None else -1
 
 
@@ -583,15 +583,16 @@ def _operation_id(value: str) -> UUID:
 SELECT_PITY_SQL = """
 select since_five, since_four, guaranteed_featured_five, version
 from gacha_runtime.pity_snapshots
-where user_id = $1 and banner_id = $2
+where user_id = $1 and pity_group_id = $2
 """
 
 INSERT_INITIAL_PITY_SQL = """
 insert into gacha_runtime.pity_snapshots (
-  user_id, banner_id, since_five, since_four, guaranteed_featured_five, version
+  user_id, banner_id, pity_group_id,
+  since_five, since_four, guaranteed_featured_five, version
 )
-values ($1, $2, 0, 0, false, 0)
-on conflict (user_id, banner_id) do nothing
+values ($1, $2, $2, 0, 0, false, 0)
+on conflict (user_id, pity_group_id) do nothing
 """
 
 UPDATE_PITY_SQL = """
@@ -601,14 +602,14 @@ set since_five = $4,
     guaranteed_featured_five = $6,
     version = version + 1,
     updated_at = now()
-where user_id = $1 and banner_id = $2 and version = $3
+where user_id = $1 and pity_group_id = $2 and version = $3
 returning since_five, since_four, guaranteed_featured_five, version
 """
 
 SELECT_PITY_VERSION_SQL = """
 select version
 from gacha_runtime.pity_snapshots
-where user_id = $1 and banner_id = $2
+where user_id = $1 and pity_group_id = $2
 """
 
 INSERT_PULL_OPERATION_SQL = """

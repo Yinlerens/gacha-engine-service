@@ -267,7 +267,8 @@ def register_routes(app: FastAPI) -> None:
         user_id: UUID = Depends(current_user_id),
     ) -> PitySnapshot:
         snapshot = await current_catalog_snapshot(request)
-        if banner_id not in snapshot.banner_configs_by_id:
+        banner_config = snapshot.banner_configs_by_id.get(banner_id)
+        if banner_config is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "banner_not_found", "message": "banner was not found"},
@@ -275,7 +276,10 @@ def register_routes(app: FastAPI) -> None:
 
         services: AppServices = request.app.state.services
         try:
-            return await services.state_store.get_snapshot(user_id, banner_id)
+            return await services.state_store.get_snapshot(
+                user_id,
+                banner_config.pity_group_id,
+            )
         except GachaStateStoreError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -404,6 +408,7 @@ def register_routes(app: FastAPI) -> None:
                 metadata=pull_asset_metadata(
                     event_id=str(existing_context.event_id),
                     banner_id=existing_context.banner.id,
+                    pity_group_id=existing_context.pity_group_id,
                     banner_version_id=existing_context.banner_version_id,
                     count=existing_context.count,
                 ),
@@ -438,6 +443,7 @@ async def execute_claimed_pull(
     metadata = pull_asset_metadata(
         event_id=event_id,
         banner_id=banner.id,
+        pity_group_id=context.pity_group_id,
         banner_version_id=context.banner_version_id,
         count=context.count,
     )
@@ -546,7 +552,10 @@ async def generate_and_commit_pull_with_retry(
     event_id = str(context.event_id)
 
     for attempt in range(1, PITY_COMMIT_MAX_ATTEMPTS + 1):
-        previous_pity = await services.state_store.get_snapshot(user_id, banner.id)
+        previous_pity = await services.state_store.get_snapshot(
+            user_id,
+            context.pity_group_id,
+        )
         records, next_pity_state = perform_pulls(
             banner_config=banner_config,
             count=context.count,
@@ -559,6 +568,7 @@ async def generate_and_commit_pull_with_retry(
         )
         response = PullResponse(
             event_id=event_id,
+            pity_group_id=context.pity_group_id,
             banner_version_id=context.banner_version_id,
             seed=context.seed,
             records=records,
@@ -570,6 +580,7 @@ async def generate_and_commit_pull_with_retry(
             event_id=event_id,
             user_id=str(user_id),
             banner_id=banner.id,
+            pity_group_id=context.pity_group_id,
             banner_version_id=context.banner_version_id,
             seed=context.seed,
             records=records,
@@ -582,7 +593,7 @@ async def generate_and_commit_pull_with_retry(
             await services.state_store.compare_and_set_with_pull_operation(
                 operation_key=operation_key,
                 user_id=user_id,
-                banner_id=banner.id,
+                pity_group_id=context.pity_group_id,
                 request_hash=request_hash,
                 expected_version=previous_pity.version,
                 next_pity=next_pity_state,
@@ -1211,6 +1222,7 @@ async def recover_pending_pull_refunds_once(
         metadata = pull_asset_metadata(
             event_id=event_id,
             banner_id=context.banner.id,
+            pity_group_id=context.pity_group_id,
             banner_version_id=context.banner_version_id,
             count=context.count,
         )
@@ -1335,6 +1347,7 @@ def pull_asset_metadata(
     *,
     event_id: str,
     banner_id: str,
+    pity_group_id: str,
     banner_version_id: str | None,
     count: int,
 ) -> dict[str, object]:
@@ -1342,6 +1355,7 @@ def pull_asset_metadata(
         "source": "gacha-engine-service",
         "event_id": event_id,
         "banner_id": banner_id,
+        "pity_group_id": pity_group_id,
         "count": count,
         "cost_per_pull_minor": ASTRITE_PER_PULL,
     }

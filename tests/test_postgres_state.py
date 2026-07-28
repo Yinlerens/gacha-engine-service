@@ -288,7 +288,7 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await store.compare_and_set_with_pull_operation(
             operation_key=str(OPERATION_ID),
             user_id=USER_ID,
-            banner_id="limited-character-001",
+            pity_group_id="limited-character-001",
             request_hash=REQUEST_HASH,
             expected_version=0,
             next_pity=PityState(since_five=1, since_four=1),
@@ -323,7 +323,7 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
             await store.compare_and_set_with_pull_operation(
                 operation_key=str(OPERATION_ID),
                 user_id=USER_ID,
-                banner_id="limited-character-001",
+                pity_group_id="limited-character-001",
                 request_hash=REQUEST_HASH,
                 expected_version=0,
                 next_pity=PityState(since_five=1, since_four=1),

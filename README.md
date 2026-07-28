@@ -77,6 +77,9 @@ GACHA_STATE_POOL_SIZE=8
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000001_gacha_runtime_state.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000002_pull_processing_lease.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000003_pull_unattended_recovery.up.sql
+psql "$GACHA_STATE_DATABASE_URL" -f migrations/000004_pity_groups_expand.up.sql
+psql "$GACHA_STATE_DATABASE_URL" -f migrations/000005_backfill_pity_groups.up.sql
+psql "$GACHA_STATE_DATABASE_URL" -f migrations/000006_pity_groups_enforce.up.sql
 ```
 
 生产环境不能清理 `gacha_runtime.pull_operations` 中的幂等键；如需归档响应正文，也必须永久保留 `(user_id, idempotency_key_hash)` 墓碑。
@@ -133,9 +136,11 @@ Postgres 是抽卡操作、原始响应和保底快照的唯一事实源。幂�
 
 同一用户在同一卡池并发抽取时，请求可以先读取到相同的保底版本，但只有一个能提交。其他请求会自动读取已提交的新版本、重新计算候选结果并继续提交；持续竞争超过当前处理轮次时保留为 `processing` 交给恢复 Worker，已扣款请求不会因为保底版本竞争而退款。
 
+保底状态按发布配置中的 `pity_group_id` 隔离，而不是按展示用的 `banner_id` 隐式隔离。同一保底组可以跨卡池版本继承，不同组严格分开；旧快照和旧恢复记录缺少该字段时会回退到原 `banner_id`，因此升级不会重置已有保底。修改已投入使用的保底组属于数据迁移，不能只改配置。
+
 `event_pending` 记录同时承担 Outbox 职责，Kafka 恢复任务会按数据库租约重复投递，背包服务再按 `event_id` 去重。
 
-抽卡响应和 Kafka 事件会带上 `banner_version_id`，用于追溯当次抽卡使用的卡池配置版本。
+抽卡响应和 Kafka 事件会带上 `banner_version_id` 与 `pity_group_id`，用于追溯当次抽卡使用的卡池配置版本和保底作用域。
 
 网关接入时，把公开路径 `/api/v1/gacha` 转发到服务内的 `/v1`：
 

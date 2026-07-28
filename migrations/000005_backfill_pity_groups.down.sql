@@ -1,0 +1,1 @@
+-- Irreversible: clearing this backfill could detach live pity state from its group.

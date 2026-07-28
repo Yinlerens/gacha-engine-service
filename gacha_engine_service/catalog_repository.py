@@ -186,6 +186,7 @@ def _build_snapshot_from_release(
             {
                 "banner_version_id": version_id,
                 "banner_id": banner_id,
+                "pity_group_id": banner.get("pity_group_id") or banner_id,
                 "rule_set_id": version.get("rule_set_id"),
                 "version": version["version"],
                 "name": banner["name"],
@@ -368,6 +369,7 @@ def _build_snapshot(
         banners.append(banner)
         configs[banner.id] = BannerConfig(
             banner=banner,
+            pity_group_id=_pity_group_id_from_row(row, banner.id),
             banner_version_id=version_id,
             version=int(row["version"]),
             all_items=items,
@@ -471,6 +473,14 @@ def _optional_row_value(row: Any, key: str) -> Any:
         return row[key]
     except KeyError:
         return None
+
+
+def _pity_group_id_from_row(row: Any, banner_id: str) -> str:
+    raw_value = _optional_row_value(row, "pity_group_id")
+    pity_group_id = str(raw_value) if raw_value is not None else banner_id
+    if not pity_group_id or pity_group_id != pity_group_id.strip() or len(pity_group_id) > 100:
+        raise CatalogLoadError(f"banner {banner_id} has an invalid pity group id")
+    return pity_group_id
 
 
 def _json_object(value: Any) -> dict[str, Any]:

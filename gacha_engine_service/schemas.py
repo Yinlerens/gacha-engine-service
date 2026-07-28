@@ -100,6 +100,7 @@ class PullRecord(BaseModel):
 
 class PullResponse(BaseModel):
     event_id: str
+    pity_group_id: str | None = None
     banner_version_id: str | None = None
     seed: str
     records: list[PullRecord]
@@ -125,6 +126,7 @@ class PullCompletedEvent(BaseModel):
     event_type: Literal["gacha.pull_completed.v1"] = "gacha.pull_completed.v1"
     user_id: str
     banner_id: str
+    pity_group_id: str | None = None
     banner_version_id: str | None = None
     seed: str
     records: list[PullRecord]

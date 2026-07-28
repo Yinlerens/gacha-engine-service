@@ -1,0 +1,1 @@
+drop index concurrently if exists gacha_runtime.pity_snapshots_user_pity_group_uidx;

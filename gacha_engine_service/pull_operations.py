@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .catalog_config import BannerConfig, FeaturedRule, PityRule, RarityRate
 from .schemas import Banner, GachaItem, PullCompletedEvent, PullResponse
@@ -49,6 +49,7 @@ class PullRecoveryContext(BaseModel):
     """Frozen inputs required to finish a charged pull without the client."""
 
     banner: Banner
+    pity_group_id: str = Field(min_length=1, max_length=100)
     banner_version_id: str | None = None
     banner_version: int
     items: tuple[GachaItem, ...]
@@ -61,6 +62,21 @@ class PullRecoveryContext(BaseModel):
     event_id: UUID
     amount_minor: int = Field(gt=0)
     request_id: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def restore_legacy_pity_group(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("pity_group_id"):
+            return value
+
+        banner = value.get("banner")
+        banner_id = banner.get("id") if isinstance(banner, dict) else getattr(banner, "id", None)
+        if not banner_id:
+            return value
+
+        restored = dict(value)
+        restored["pity_group_id"] = banner_id
+        return restored
 
     @classmethod
     def from_banner_config(
@@ -75,6 +91,7 @@ class PullRecoveryContext(BaseModel):
     ) -> PullRecoveryContext:
         return cls(
             banner=banner_config.banner,
+            pity_group_id=banner_config.pity_group_id,
             banner_version_id=banner_config.banner_version_id,
             banner_version=banner_config.version,
             items=banner_config.all_items,
@@ -123,6 +140,7 @@ class PullRecoveryContext(BaseModel):
         items = tuple(self.items)
         return BannerConfig(
             banner=self.banner,
+            pity_group_id=self.pity_group_id,
             banner_version_id=self.banner_version_id,
             version=self.banner_version,
             all_items=items,

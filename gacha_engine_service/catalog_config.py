@@ -60,6 +60,7 @@ class PityRule:
 @dataclass(frozen=True)
 class BannerConfig:
     banner: Banner
+    pity_group_id: str
     banner_version_id: str | None
     version: int
     all_items: tuple[GachaItem, ...]
@@ -151,6 +152,7 @@ def _static_banner_config(
 
     return BannerConfig(
         banner=banner,
+        pity_group_id=banner.id,
         banner_version_id=None,
         version=1,
         all_items=items,
