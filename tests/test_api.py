@@ -852,7 +852,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.credits), 1)
         operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
         self.assertEqual(operation.status, "failed")
-        self.assertIsNone(operation.recovery_context)
+        self.assertIsNotNone(operation.recovery_context)
 
     def test_two_refund_workers_only_complete_one_refund(self) -> None:
         state_store = FakePityStateStore()
@@ -985,7 +985,8 @@ class ApiTests(unittest.TestCase):
         operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
         self.assertEqual(operation.status, "succeeded")
         self.assertIsNotNone(operation.response)
-        self.assertIsNone(operation.recovery_context)
+        self.assertIsNotNone(operation.recovery_context)
+        self.assertIsNotNone(operation.recovery_context.accepted_at)
 
     def test_transient_asset_failure_keeps_pull_available_for_safe_resume(self) -> None:
         state_store = FakePityStateStore()

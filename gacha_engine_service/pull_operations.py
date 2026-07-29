@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -62,6 +63,7 @@ class PullRecoveryContext(BaseModel):
     event_id: UUID
     amount_minor: int = Field(gt=0)
     request_id: str = ""
+    accepted_at: datetime | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -88,6 +90,7 @@ class PullRecoveryContext(BaseModel):
         event_id: str,
         amount_minor: int,
         request_id: str,
+        accepted_at: datetime | None = None,
     ) -> PullRecoveryContext:
         return cls(
             banner=banner_config.banner,
@@ -134,6 +137,7 @@ class PullRecoveryContext(BaseModel):
             event_id=event_id,
             amount_minor=amount_minor,
             request_id=request_id,
+            accepted_at=accepted_at,
         )
 
     def to_banner_config(self) -> BannerConfig:

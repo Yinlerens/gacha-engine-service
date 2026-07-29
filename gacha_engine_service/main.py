@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -50,7 +51,9 @@ LOGGER = logging.getLogger(__name__)
 ASTRITE_PER_PULL = 160
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 REQUEST_ID_HEADER = "X-Request-Id"
+REQUEST_ACCEPTED_AT_HEADER = "X-Request-Accepted-At"
 MAX_IDEMPOTENCY_KEY_LENGTH = 128
+MAX_ACCEPTED_AT_FUTURE_SKEW_SECONDS = 5
 PULL_PROCESSING_LEASE_SECONDS = 30
 PITY_COMMIT_MAX_ATTEMPTS = 5
 PITY_COMMIT_RETRY_DELAY_SECONDS = 0.01
@@ -253,7 +256,8 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/v1/banners", tags=["catalog"])
     async def list_banners(request: Request) -> dict[str, object]:
         snapshot = await current_catalog_snapshot(request)
-        return {"items": [banner.model_dump(mode="json") for banner in snapshot.banners]}
+        banners = snapshot.banners_at(datetime.now(timezone.utc))
+        return {"items": [banner.model_dump(mode="json") for banner in banners]}
 
     @app.get("/v1/items", tags=["catalog"])
     async def list_items(request: Request) -> dict[str, object]:
@@ -267,7 +271,7 @@ def register_routes(app: FastAPI) -> None:
         user_id: UUID = Depends(current_user_id),
     ) -> PitySnapshot:
         snapshot = await current_catalog_snapshot(request)
-        banner_config = snapshot.banner_configs_by_id.get(banner_id)
+        banner_config = snapshot.banner_config_at(banner_id, datetime.now(timezone.utc))
         if banner_config is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -346,24 +350,57 @@ def register_routes(app: FastAPI) -> None:
         request: Request,
         user_id: UUID = Depends(current_user_id),
         idempotency_key: str = Depends(idempotency_key_header),
+        accepted_at: datetime = Depends(request_accepted_at_header),
     ) -> PullResponse:
         request_id = request_id_from_state(request)
-        snapshot = await current_catalog_snapshot(request)
-        banner_config = snapshot.banner_configs_by_id.get(pull_request.banner_id)
-        if banner_config is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={"code": "banner_not_found", "message": "banner was not found"},
-            )
-        banner = banner_config.banner
-
         services: AppServices = request.app.state.services
         seed = pull_request.seed or deterministic_pull_seed(user_id, idempotency_key)
         request_hash = pull_request_hash(
-            banner_id=banner.id,
+            banner_id=pull_request.banner_id,
             count=pull_request.count,
             seed=seed,
         )
+        snapshot = await current_catalog_snapshot(request)
+        banner_config = snapshot.banner_config_at(pull_request.banner_id, accepted_at)
+        if banner_config is None:
+            try:
+                existing_operation = await services.state_store.get_pull_operation(
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                )
+            except GachaStateStoreError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "state_store_unavailable",
+                        "message": "pull idempotency is unavailable",
+                    },
+                ) from exc
+
+            if existing_operation is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={"code": "banner_not_found", "message": "banner was not found"},
+                )
+            if existing_operation.recovery_context is None:
+                return await handle_existing_pull_request(
+                    operation=existing_operation,
+                    services=services,
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    pull_request=pull_request,
+                    request_id=request_id,
+                )
+            return await claim_or_resume_pull(
+                services=services,
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                recovery_context=existing_operation.recovery_context,
+                request_id=request_id,
+            )
+
         cost_minor = pull_request.count * ASTRITE_PER_PULL
         event_id = deterministic_pull_event_id(user_id, idempotency_key)
         recovery_context = PullRecoveryContext.from_banner_config(
@@ -373,59 +410,75 @@ def register_routes(app: FastAPI) -> None:
             event_id=event_id,
             amount_minor=cost_minor,
             request_id=request_id,
+            accepted_at=accepted_at,
         )
-
-        try:
-            operation_claim = await services.state_store.begin_pull_operation(
-                user_id=user_id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-                processing_lease_seconds=PULL_PROCESSING_LEASE_SECONDS,
-                recovery_context=recovery_context,
-            )
-        except GachaStateStoreError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "code": "state_store_unavailable",
-                    "message": "pull idempotency is unavailable",
-                },
-            ) from exc
-
-        if not operation_claim.acquired:
-            existing_context = (
-                operation_claim.operation.recovery_context or recovery_context
-            )
-            return await handle_existing_pull_operation(
-                operation=operation_claim.operation,
-                services=services,
-                user_id=user_id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-                event_id=str(existing_context.event_id),
-                amount_minor=existing_context.amount_minor,
-                request_id=request_id,
-                metadata=pull_asset_metadata(
-                    event_id=str(existing_context.event_id),
-                    banner_id=existing_context.banner.id,
-                    pity_group_id=existing_context.pity_group_id,
-                    banner_version_id=existing_context.banner_version_id,
-                    count=existing_context.count,
-                ),
-            )
-
-        processing_token = operation_claim.processing_token
-        if processing_token is None:
-            raise RuntimeError("acquired pull operation is missing its processing token")
-        claimed_context = operation_claim.operation.recovery_context or recovery_context
-        return await execute_claimed_pull(
+        return await claim_or_resume_pull(
             services=services,
             user_id=user_id,
-            operation_key=operation_claim.operation_key,
+            idempotency_key=idempotency_key,
             request_hash=request_hash,
-            processing_token=processing_token,
-            context=claimed_context,
+            recovery_context=recovery_context,
+            request_id=request_id,
         )
+
+
+async def claim_or_resume_pull(
+    *,
+    services: AppServices,
+    user_id: UUID,
+    idempotency_key: str,
+    request_hash: str,
+    recovery_context: PullRecoveryContext,
+    request_id: str,
+) -> PullResponse:
+    try:
+        operation_claim = await services.state_store.begin_pull_operation(
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            processing_lease_seconds=PULL_PROCESSING_LEASE_SECONDS,
+            recovery_context=recovery_context,
+        )
+    except GachaStateStoreError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "state_store_unavailable",
+                "message": "pull idempotency is unavailable",
+            },
+        ) from exc
+
+    claimed_context = operation_claim.operation.recovery_context or recovery_context
+    if not operation_claim.acquired:
+        return await handle_existing_pull_operation(
+            operation=operation_claim.operation,
+            services=services,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            event_id=str(claimed_context.event_id),
+            amount_minor=claimed_context.amount_minor,
+            request_id=request_id,
+            metadata=pull_asset_metadata(
+                event_id=str(claimed_context.event_id),
+                banner_id=claimed_context.banner.id,
+                pity_group_id=claimed_context.pity_group_id,
+                banner_version_id=claimed_context.banner_version_id,
+                count=claimed_context.count,
+            ),
+        )
+
+    processing_token = operation_claim.processing_token
+    if processing_token is None:
+        raise RuntimeError("acquired pull operation is missing its processing token")
+    return await execute_claimed_pull(
+        services=services,
+        user_id=user_id,
+        operation_key=operation_claim.operation_key,
+        request_hash=request_hash,
+        processing_token=processing_token,
+        context=claimed_context,
+    )
 
 
 async def execute_claimed_pull(
@@ -484,6 +537,7 @@ async def execute_claimed_pull(
                     request_hash=request_hash,
                     error_code=asset_error_code(exc),
                     error_message=asset_error_message(exc),
+                    recovery_context=context,
                 ),
             )
         except PullOperationOwnershipLost as ownership_error:
@@ -535,6 +589,7 @@ async def execute_claimed_pull(
         request_hash=request_hash,
         response=response,
         event=event,
+        context=context,
     )
 
 
@@ -602,6 +657,7 @@ async def generate_and_commit_pull_with_retry(
                     request_hash=request_hash,
                     response=response,
                     event=event,
+                    recovery_context=context,
                 ),
                 processing_token=processing_token,
             )
@@ -648,6 +704,7 @@ async def handle_claimed_pull_operation(
             request_hash=request_hash,
             response=operation.response,
             event=operation.event,
+            context=operation.recovery_context or context,
         )
     if operation.status == "refund_pending":
         await refund_claimed_spend(
@@ -659,6 +716,7 @@ async def handle_claimed_pull_operation(
             metadata=metadata,
             code=operation.error_code or "pull_refunded",
             message=operation.error_message or "pull was refunded",
+            recovery_context=operation.recovery_context,
         )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -685,6 +743,7 @@ async def publish_and_complete_claimed_pull(
     request_hash: str,
     response: PullResponse,
     event: PullCompletedEvent,
+    context: PullRecoveryContext,
 ) -> PullResponse:
     try:
         await publish_pull_completed_with_retry(services.event_publisher, event)
@@ -705,6 +764,7 @@ async def publish_and_complete_claimed_pull(
                 request_hash=request_hash,
                 response=response,
                 event=event,
+                recovery_context=context,
             ),
         )
     except GachaStateStoreError:
@@ -754,6 +814,7 @@ async def refund_claimed_spend(
             request_hash=request_hash,
             error_code=code,
             error_message=message,
+            recovery_context=context,
         ),
     )
 
@@ -821,6 +882,120 @@ def idempotency_key_header(
     return idempotency_key
 
 
+def request_accepted_at_header(
+    value: str | None = Header(default=None, alias=REQUEST_ACCEPTED_AT_HEADER),
+) -> datetime:
+    raw_value = (value or "").strip()
+    if not raw_value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "missing_request_accepted_at",
+                "message": "trusted request acceptance time is required",
+            },
+        )
+
+    try:
+        accepted_at = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_request_accepted_at",
+                "message": "trusted request acceptance time is invalid",
+            },
+        ) from exc
+
+    if accepted_at.tzinfo is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_request_accepted_at",
+                "message": "trusted request acceptance time must include a timezone",
+            },
+        )
+
+    accepted_at = accepted_at.astimezone(timezone.utc)
+    latest_allowed = datetime.now(timezone.utc) + timedelta(
+        seconds=MAX_ACCEPTED_AT_FUTURE_SKEW_SECONDS
+    )
+    if accepted_at > latest_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_request_accepted_at",
+                "message": "trusted request acceptance time is too far in the future",
+            },
+        )
+    return accepted_at
+
+
+async def handle_existing_pull_request(
+    *,
+    operation: PullOperation,
+    services: AppServices,
+    user_id: UUID,
+    idempotency_key: str,
+    request_hash: str,
+    pull_request: PullRequest,
+    request_id: str,
+) -> PullResponse:
+    context = operation.recovery_context
+    response = operation.response
+    event = operation.event
+    event_id = (
+        str(context.event_id)
+        if context is not None
+        else event.event_id
+        if event is not None
+        else deterministic_pull_event_id(user_id, idempotency_key)
+    )
+    pity_group_id = (
+        context.pity_group_id
+        if context is not None
+        else response.pity_group_id
+        if response is not None
+        else event.pity_group_id
+        if event is not None
+        else None
+    )
+    banner_version_id = (
+        context.banner_version_id
+        if context is not None
+        else response.banner_version_id
+        if response is not None
+        else event.banner_version_id
+        if event is not None
+        else None
+    )
+    banner_id = (
+        context.banner.id
+        if context is not None
+        else event.banner_id
+        if event is not None
+        else pull_request.banner_id
+    )
+    count = context.count if context is not None else pull_request.count
+    amount_minor = context.amount_minor if context is not None else count * ASTRITE_PER_PULL
+    return await handle_existing_pull_operation(
+        operation=operation,
+        services=services,
+        user_id=user_id,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        event_id=event_id,
+        amount_minor=amount_minor,
+        request_id=request_id,
+        metadata=pull_asset_metadata(
+            event_id=event_id,
+            banner_id=banner_id,
+            pity_group_id=pity_group_id,
+            banner_version_id=banner_version_id,
+            count=count,
+        ),
+    )
+
+
 async def handle_existing_pull_operation(
     *,
     operation: PullOperation,
@@ -863,6 +1038,7 @@ async def handle_existing_pull_operation(
                 request_hash=request_hash,
                 response=operation.response,
                 event=operation.event,
+                recovery_context=operation.recovery_context,
             ),
         )
         return operation.response
@@ -879,6 +1055,7 @@ async def handle_existing_pull_operation(
             metadata=metadata,
             code=operation.error_code or "pull_refunded",
             message=operation.error_message or "pull was refunded",
+            recovery_context=operation.recovery_context,
         )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -915,6 +1092,7 @@ async def refund_spend(
     request_id: str,
     code: str,
     message: str,
+    recovery_context: PullRecoveryContext | None,
 ) -> None:
     try:
         await services.asset_client.credit(
@@ -947,6 +1125,7 @@ async def refund_spend(
         request_hash=request_hash,
         code=code,
         message=message,
+        recovery_context=recovery_context,
     )
 
 
@@ -958,6 +1137,7 @@ async def mark_pull_operation_failed(
     request_hash: str,
     code: str,
     message: str,
+    recovery_context: PullRecoveryContext | None = None,
 ) -> None:
     await save_pull_operation_best_effort(
         services=services,
@@ -968,6 +1148,7 @@ async def mark_pull_operation_failed(
             request_hash=request_hash,
             error_code=code,
             error_message=message,
+            recovery_context=recovery_context,
         ),
     )
 
@@ -1148,6 +1329,7 @@ async def recover_pending_pull_events_once(
                     request_hash=operation.request_hash,
                     response=operation.response,
                     event=operation.event,
+                    recovery_context=operation.recovery_context,
                 ),
             )
             recovered_count += 1

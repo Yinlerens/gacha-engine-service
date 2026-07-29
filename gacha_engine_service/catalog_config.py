@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Mapping
 
@@ -95,12 +95,56 @@ class BannerConfig:
 
 
 @dataclass(frozen=True)
+class ScheduledBannerConfig:
+    config: BannerConfig
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
+
+    def is_effective_at(self, effective_at: datetime) -> bool:
+        if effective_at.tzinfo is None:
+            raise ValueError("effective_at must include a timezone")
+        return (
+            (self.effective_from is None or self.effective_from <= effective_at)
+            and (self.effective_to is None or effective_at < self.effective_to)
+        )
+
+
+@dataclass(frozen=True)
 class CatalogSnapshot:
     source: str
     loaded_at: datetime
     items: tuple[GachaItem, ...]
     banners: tuple[Banner, ...]
     banner_configs_by_id: Mapping[str, BannerConfig]
+    banner_schedules_by_id: Mapping[str, tuple[ScheduledBannerConfig, ...]] = field(
+        default_factory=dict
+    )
+
+    def banner_config_at(
+        self,
+        banner_id: str,
+        effective_at: datetime,
+    ) -> BannerConfig | None:
+        schedules = self.banner_schedules_by_id.get(banner_id)
+        if not schedules:
+            return self.banner_configs_by_id.get(banner_id)
+
+        effective = [
+            schedule.config
+            for schedule in schedules
+            if schedule.is_effective_at(effective_at)
+        ]
+        if len(effective) > 1:
+            raise ValueError(f"banner {banner_id} has overlapping effective schedules")
+        return effective[0] if effective else None
+
+    def banners_at(self, effective_at: datetime) -> tuple[Banner, ...]:
+        banner_ids = set(self.banner_configs_by_id) | set(self.banner_schedules_by_id)
+        return tuple(
+            config.banner
+            for banner_id in sorted(banner_ids)
+            if (config := self.banner_config_at(banner_id, effective_at)) is not None
+        )
 
 
 def static_catalog_snapshot() -> CatalogSnapshot:

@@ -12,6 +12,7 @@ from .catalog_config import (
     FeaturedRule,
     PityRule,
     RarityRate,
+    ScheduledBannerConfig,
     static_catalog_snapshot,
 )
 from .schemas import Banner, BannerTheme, GachaItem
@@ -164,24 +165,17 @@ def _build_snapshot_from_release(
         for row in _release_array(payload, "banners")
     }
     effective_at = now or datetime.now(timezone.utc)
-    active_version_ids: set[str] = set()
-    active_banner_ids: set[str] = set()
+    version_ids: set[str] = set()
     banner_rows: list[dict[str, Any]] = []
 
     for version in _release_array(payload, "banner_versions"):
-        if not _version_is_effective(version, effective_at):
-            continue
-
         version_id = str(version["id"])
         banner_id = str(version["banner_id"])
         banner = banners_by_id.get(banner_id)
         if banner is None:
             raise CatalogLoadError(f"release version {version_id} references missing banner {banner_id}")
-        if banner_id in active_banner_ids:
-            raise CatalogLoadError(f"release contains overlapping active versions for banner {banner_id}")
 
-        active_version_ids.add(version_id)
-        active_banner_ids.add(banner_id)
+        version_ids.add(version_id)
         banner_rows.append(
             {
                 "banner_version_id": version_id,
@@ -194,26 +188,29 @@ def _build_snapshot_from_release(
                 "banner_type": banner["banner_type"],
                 "description": banner["description"],
                 "theme": banner["theme"],
+                "effective_from": version.get("effective_from"),
+                "effective_to": version.get("effective_to"),
             }
         )
 
-    def active_version_rows(key: str) -> list[dict[str, Any]]:
+    def version_rows(key: str) -> list[dict[str, Any]]:
         return [
             row
             for row in _release_array(payload, key)
-            if str(row["banner_version_id"]) in active_version_ids
+            if str(row["banner_version_id"]) in version_ids
         ]
 
     return _build_snapshot(
         item_rows=item_rows,
         banner_rows=banner_rows,
-        banner_item_rows=active_version_rows("banner_items"),
-        rarity_rows=active_version_rows("rarity_rates"),
-        featured_rows=active_version_rows("featured_rules"),
-        pity_rows=active_version_rows("pity_rules"),
+        banner_item_rows=version_rows("banner_items"),
+        rarity_rows=version_rows("rarity_rates"),
+        featured_rows=version_rows("featured_rules"),
+        pity_rows=version_rows("pity_rules"),
         rule_set_rarity_rows=_release_array(payload, "rule_set_rarity_rates"),
         rule_set_featured_rows=_release_array(payload, "rule_set_featured_rules"),
         rule_set_pity_rows=_release_array(payload, "rule_set_pity_rules"),
+        effective_at=effective_at,
     )
 
 
@@ -262,7 +259,9 @@ def _build_snapshot(
     rule_set_rarity_rows: list[Any] | None = None,
     rule_set_featured_rows: list[Any] | None = None,
     rule_set_pity_rows: list[Any] | None = None,
+    effective_at: datetime | None = None,
 ) -> CatalogSnapshot:
+    snapshot_time = effective_at or datetime.now(timezone.utc)
     items = tuple(_item_from_row(row) for row in item_rows)
     item_by_id = {item.id: item for item in items}
 
@@ -309,6 +308,7 @@ def _build_snapshot(
 
     banners: list[Banner] = []
     configs: dict[str, BannerConfig] = {}
+    schedules: dict[str, list[ScheduledBannerConfig]] = {}
     for row in banner_rows:
         version_id = str(row["banner_version_id"])
         raw_rule_set_id = _optional_row_value(row, "rule_set_id")
@@ -366,8 +366,7 @@ def _build_snapshot(
             pity_rules=pity_rules,
         )
 
-        banners.append(banner)
-        configs[banner.id] = BannerConfig(
+        config = BannerConfig(
             banner=banner,
             pity_group_id=_pity_group_id_from_row(row, banner.id),
             banner_version_id=version_id,
@@ -381,14 +380,46 @@ def _build_snapshot(
                 rarity: tuple(ids) for rarity, ids in featured_by_rarity.items()
             },
         )
+        schedule = ScheduledBannerConfig(
+            config=config,
+            effective_from=_optional_release_timestamp(row, "effective_from"),
+            effective_to=_optional_release_timestamp(row, "effective_to"),
+        )
+        schedules.setdefault(banner.id, []).append(schedule)
+        if schedule.is_effective_at(snapshot_time):
+            if banner.id in configs:
+                raise CatalogLoadError(
+                    f"release contains overlapping active versions for banner {banner.id}"
+                )
+            banners.append(banner)
+            configs[banner.id] = config
+
+    ordered_schedules = {
+        banner_id: tuple(
+            sorted(
+                banner_schedules,
+                key=lambda entry: entry.effective_from
+                or datetime.min.replace(tzinfo=timezone.utc),
+            )
+        )
+        for banner_id, banner_schedules in schedules.items()
+    }
 
     return CatalogSnapshot(
         source="postgres",
-        loaded_at=datetime.now(timezone.utc),
+        loaded_at=snapshot_time,
         items=items,
         banners=tuple(banners),
         banner_configs_by_id=configs,
+        banner_schedules_by_id=ordered_schedules,
     )
+
+
+def _optional_release_timestamp(row: Any, field_name: str) -> datetime | None:
+    value = _optional_row_value(row, field_name)
+    if value is None:
+        return None
+    return _release_timestamp(value, field_name)
 
 
 def _validate_runtime_banner_config(

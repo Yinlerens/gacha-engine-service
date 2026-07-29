@@ -136,6 +136,18 @@ class CatalogRepositoryTests(unittest.TestCase):
                         "featured_group": None,
                         "sort_order": 2,
                     },
+                    {
+                        "banner_version_id": future_version_id,
+                        "item_id": "five",
+                        "featured_group": None,
+                        "sort_order": 1,
+                    },
+                    {
+                        "banner_version_id": future_version_id,
+                        "item_id": "four",
+                        "featured_group": None,
+                        "sort_order": 2,
+                    },
                 ],
                 "rarity_rates": [
                     {
@@ -146,6 +158,18 @@ class CatalogRepositoryTests(unittest.TestCase):
                     },
                     {
                         "banner_version_id": active_version_id,
+                        "rarity": 4,
+                        "base_rate_ppm": 90000,
+                        "roll_order": 2,
+                    },
+                    {
+                        "banner_version_id": future_version_id,
+                        "rarity": 5,
+                        "base_rate_ppm": 10000,
+                        "roll_order": 1,
+                    },
+                    {
+                        "banner_version_id": future_version_id,
                         "rarity": 4,
                         "base_rate_ppm": 90000,
                         "roll_order": 2,
@@ -164,6 +188,24 @@ class CatalogRepositoryTests(unittest.TestCase):
                     },
                     {
                         "banner_version_id": active_version_id,
+                        "rarity": 4,
+                        "counter_key": "four_star",
+                        "hard_pity": 10,
+                        "soft_pity_start": None,
+                        "soft_pity_increment_ppm": 0,
+                        "resets_lower_rarity": False,
+                    },
+                    {
+                        "banner_version_id": future_version_id,
+                        "rarity": 5,
+                        "counter_key": "five_star",
+                        "hard_pity": 80,
+                        "soft_pity_start": None,
+                        "soft_pity_increment_ppm": 0,
+                        "resets_lower_rarity": True,
+                    },
+                    {
+                        "banner_version_id": future_version_id,
                         "rarity": 4,
                         "counter_key": "four_star",
                         "hard_pity": 10,
@@ -208,6 +250,13 @@ class CatalogRepositoryTests(unittest.TestCase):
                 "banner",
                 datetime(2026, 8, 1, tzinfo=timezone.utc),
             )
+        )
+        self.assertEqual(
+            snapshot.banner_config_at(
+                "banner",
+                datetime(2026, 9, 1, tzinfo=timezone.utc),
+            ).version,
+            2,
         )
 
     def test_build_snapshot_from_release_rejects_invalid_checksum(self) -> None:
