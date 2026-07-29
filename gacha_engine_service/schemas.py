@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -100,6 +101,7 @@ class PullRecord(BaseModel):
 
 class PullResponse(BaseModel):
     event_id: str
+    accepted_at: datetime | None = None
     pity_group_id: str | None = None
     banner_version_id: str | None = None
     seed: str
@@ -124,6 +126,7 @@ class PullOperationStateResponse(BaseModel):
 class PullCompletedEvent(BaseModel):
     event_id: str
     event_type: Literal["gacha.pull_completed.v1"] = "gacha.pull_completed.v1"
+    accepted_at: datetime | None = None
     user_id: str
     banner_id: str
     pity_group_id: str | None = None

@@ -537,7 +537,6 @@ async def execute_claimed_pull(
                     request_hash=request_hash,
                     error_code=asset_error_code(exc),
                     error_message=asset_error_message(exc),
-                    recovery_context=context,
                 ),
             )
         except PullOperationOwnershipLost as ownership_error:
@@ -589,7 +588,6 @@ async def execute_claimed_pull(
         request_hash=request_hash,
         response=response,
         event=event,
-        context=context,
     )
 
 
@@ -623,6 +621,7 @@ async def generate_and_commit_pull_with_retry(
         )
         response = PullResponse(
             event_id=event_id,
+            accepted_at=context.accepted_at,
             pity_group_id=context.pity_group_id,
             banner_version_id=context.banner_version_id,
             seed=context.seed,
@@ -633,6 +632,7 @@ async def generate_and_commit_pull_with_retry(
         )
         event = PullCompletedEvent(
             event_id=event_id,
+            accepted_at=context.accepted_at,
             user_id=str(user_id),
             banner_id=banner.id,
             pity_group_id=context.pity_group_id,
@@ -657,7 +657,6 @@ async def generate_and_commit_pull_with_retry(
                     request_hash=request_hash,
                     response=response,
                     event=event,
-                    recovery_context=context,
                 ),
                 processing_token=processing_token,
             )
@@ -704,7 +703,6 @@ async def handle_claimed_pull_operation(
             request_hash=request_hash,
             response=operation.response,
             event=operation.event,
-            context=operation.recovery_context or context,
         )
     if operation.status == "refund_pending":
         await refund_claimed_spend(
@@ -716,7 +714,6 @@ async def handle_claimed_pull_operation(
             metadata=metadata,
             code=operation.error_code or "pull_refunded",
             message=operation.error_message or "pull was refunded",
-            recovery_context=operation.recovery_context,
         )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -743,7 +740,6 @@ async def publish_and_complete_claimed_pull(
     request_hash: str,
     response: PullResponse,
     event: PullCompletedEvent,
-    context: PullRecoveryContext,
 ) -> PullResponse:
     try:
         await publish_pull_completed_with_retry(services.event_publisher, event)
@@ -764,7 +760,6 @@ async def publish_and_complete_claimed_pull(
                 request_hash=request_hash,
                 response=response,
                 event=event,
-                recovery_context=context,
             ),
         )
     except GachaStateStoreError:
@@ -814,7 +809,6 @@ async def refund_claimed_spend(
             request_hash=request_hash,
             error_code=code,
             error_message=message,
-            recovery_context=context,
         ),
     )
 
@@ -1038,7 +1032,6 @@ async def handle_existing_pull_operation(
                 request_hash=request_hash,
                 response=operation.response,
                 event=operation.event,
-                recovery_context=operation.recovery_context,
             ),
         )
         return operation.response
@@ -1055,7 +1048,6 @@ async def handle_existing_pull_operation(
             metadata=metadata,
             code=operation.error_code or "pull_refunded",
             message=operation.error_message or "pull was refunded",
-            recovery_context=operation.recovery_context,
         )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1092,7 +1084,6 @@ async def refund_spend(
     request_id: str,
     code: str,
     message: str,
-    recovery_context: PullRecoveryContext | None,
 ) -> None:
     try:
         await services.asset_client.credit(
@@ -1125,7 +1116,6 @@ async def refund_spend(
         request_hash=request_hash,
         code=code,
         message=message,
-        recovery_context=recovery_context,
     )
 
 
@@ -1137,7 +1127,6 @@ async def mark_pull_operation_failed(
     request_hash: str,
     code: str,
     message: str,
-    recovery_context: PullRecoveryContext | None = None,
 ) -> None:
     await save_pull_operation_best_effort(
         services=services,
@@ -1148,7 +1137,6 @@ async def mark_pull_operation_failed(
             request_hash=request_hash,
             error_code=code,
             error_message=message,
-            recovery_context=recovery_context,
         ),
     )
 
@@ -1329,7 +1317,6 @@ async def recover_pending_pull_events_once(
                     request_hash=operation.request_hash,
                     response=operation.response,
                     event=operation.event,
-                    recovery_context=operation.recovery_context,
                 ),
             )
             recovered_count += 1
