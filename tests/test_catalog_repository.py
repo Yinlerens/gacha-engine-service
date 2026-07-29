@@ -196,6 +196,19 @@ class CatalogRepositoryTests(unittest.TestCase):
             snapshot.banner_configs_by_id["banner"].pity_group_id,
             "limited-character-shared",
         )
+        self.assertEqual(
+            snapshot.banner_config_at(
+                "banner",
+                datetime(2026, 7, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
+            ).version,
+            1,
+        )
+        self.assertIsNone(
+            snapshot.banner_config_at(
+                "banner",
+                datetime(2026, 8, 1, tzinfo=timezone.utc),
+            )
+        )
 
     def test_build_snapshot_from_release_rejects_invalid_checksum(self) -> None:
         with self.assertRaisesRegex(CatalogLoadError, "checksum"):

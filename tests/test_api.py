@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import unittest
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi.testclient import TestClient
 
 from gacha_engine_service.asset_client import AssetServiceError
-from gacha_engine_service.catalog_config import CatalogSnapshot, static_catalog_snapshot
+from gacha_engine_service.catalog_config import (
+    CatalogSnapshot,
+    ScheduledBannerConfig,
+    static_catalog_snapshot,
+)
 from gacha_engine_service.config import Settings
 from gacha_engine_service.main import (
     AppServices,
@@ -33,6 +37,7 @@ HEADERS = {
     "X-User-Id": USER_ID,
     "Idempotency-Key": "pull-test-1",
     "X-Request-Id": REQUEST_ID,
+    "X-Request-Accepted-At": datetime.now(timezone.utc).isoformat(),
 }
 
 
@@ -160,6 +165,121 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("x-request-id", response.headers)
         self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_pull_requires_trusted_gateway_accepted_at(self) -> None:
+        client, _, _, _ = make_client()
+        headers = {key: value for key, value in HEADERS.items() if key != "X-Request-Accepted-At"}
+
+        response = client.post(
+            "/v1/me/pulls",
+            headers=headers,
+            json={"banner_id": "limited-character-001", "count": 1},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "missing_request_accepted_at")
+
+    def test_pull_uses_gateway_acceptance_time_at_activity_cutoff(self) -> None:
+        base_snapshot = static_catalog_snapshot()
+        banner_config = base_snapshot.banner_configs_by_id["limited-character-001"]
+        cutoff = datetime.now(timezone.utc)
+        scheduled = ScheduledBannerConfig(
+            config=banner_config,
+            effective_from=cutoff - timedelta(days=1),
+            effective_to=cutoff,
+        )
+        snapshot = CatalogSnapshot(
+            source="test",
+            loaded_at=cutoff + timedelta(seconds=10),
+            items=base_snapshot.items,
+            banners=(),
+            banner_configs_by_id={},
+            banner_schedules_by_id={banner_config.banner.id: (scheduled,)},
+        )
+        client, state_store, _, asset_client = make_client(
+            catalog_repository=FixedCatalogRepository(snapshot)
+        )
+        before_cutoff = cutoff - timedelta(microseconds=1)
+        headers = {
+            **HEADERS,
+            "X-Request-Accepted-At": before_cutoff.isoformat(),
+            "Idempotency-Key": "cutoff-before",
+        }
+
+        accepted = client.post(
+            "/v1/me/pulls",
+            headers=headers,
+            json={"banner_id": banner_config.banner.id, "count": 1},
+        )
+
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        operation = state_store.operations[(UUID(USER_ID), "cutoff-before")]
+        self.assertEqual(operation.recovery_context.accepted_at, before_cutoff)
+        self.assertEqual(len(asset_client.spends), 1)
+
+        rejected = client.post(
+            "/v1/me/pulls",
+            headers={
+                **HEADERS,
+                "X-Request-Accepted-At": cutoff.isoformat(),
+                "Idempotency-Key": "cutoff-at",
+            },
+            json={"banner_id": banner_config.banner.id, "count": 1},
+        )
+
+        self.assertEqual(rejected.status_code, 404)
+        self.assertEqual(rejected.json()["error"]["code"], "banner_not_found")
+        self.assertEqual(len(asset_client.spends), 1)
+
+    def test_completed_pull_replays_after_activity_end(self) -> None:
+        base_snapshot = static_catalog_snapshot()
+        banner_config = base_snapshot.banner_configs_by_id["limited-character-001"]
+        cutoff = datetime.now(timezone.utc)
+        snapshot = CatalogSnapshot(
+            source="test",
+            loaded_at=cutoff,
+            items=base_snapshot.items,
+            banners=(),
+            banner_configs_by_id={},
+            banner_schedules_by_id={
+                banner_config.banner.id: (
+                    ScheduledBannerConfig(
+                        config=banner_config,
+                        effective_from=cutoff - timedelta(days=1),
+                        effective_to=cutoff,
+                    ),
+                )
+            },
+        )
+        client, _, _, asset_client = make_client(
+            catalog_repository=FixedCatalogRepository(snapshot)
+        )
+        idempotency_key = "cutoff-replay"
+        request_body = {"banner_id": banner_config.banner.id, "count": 1}
+
+        first = client.post(
+            "/v1/me/pulls",
+            headers={
+                **HEADERS,
+                "X-Request-Accepted-At": (cutoff - timedelta(microseconds=1)).isoformat(),
+                "Idempotency-Key": idempotency_key,
+            },
+            json=request_body,
+        )
+        replay = client.post(
+            "/v1/me/pulls",
+            headers={
+                **HEADERS,
+                "X-Request-Accepted-At": (cutoff + timedelta(seconds=1)).isoformat(),
+                "Idempotency-Key": idempotency_key,
+            },
+            json=request_body,
+        )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json(), first.json())
+        self.assertEqual(len(asset_client.spends), 1)
 
     def test_ready_returns_ready_when_dependencies_ping(self) -> None:
         client, _, _, _ = make_client()
