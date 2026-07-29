@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from gacha_engine_service.asset_client import AssetServiceError
@@ -22,6 +23,7 @@ from gacha_engine_service.main import (
     recover_expired_processing_pulls_once,
     recover_pending_pull_events_once,
     recover_pending_pull_refunds_once,
+    request_accepted_at_header,
 )
 from gacha_engine_service.postgres_state import PostgresGachaStateStore
 from gacha_engine_service.pull_operations import PullOperation, PullRecoveryContext
@@ -178,6 +180,27 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "missing_request_accepted_at")
+
+    def test_gateway_acceptance_time_supports_rfc3339_nanoseconds(self) -> None:
+        one_second_ago = datetime.now(timezone.utc) - timedelta(seconds=1)
+        raw_value = one_second_ago.strftime("%Y-%m-%dT%H:%M:%S") + ".123456789Z"
+
+        accepted_at = request_accepted_at_header(raw_value)
+
+        self.assertEqual(accepted_at.tzinfo, timezone.utc)
+        self.assertEqual(accepted_at.microsecond, 123456)
+
+    def test_gateway_acceptance_time_rejects_excessive_future_skew(self) -> None:
+        future_value = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+        with self.assertRaises(HTTPException) as raised:
+            request_accepted_at_header(future_value.isoformat())
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "invalid_request_accepted_at",
+        )
 
     def test_pull_uses_gateway_acceptance_time_at_activity_cutoff(self) -> None:
         base_snapshot = static_catalog_snapshot()
