@@ -392,6 +392,19 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         for version in ("000004", "000005", "000006"):
             self.assertTrue(any(migrations.glob(f"{version}_*.down.sql")))
 
+    def test_pull_audit_migration_protects_completed_evidence(self) -> None:
+        migrations = Path(__file__).parents[1] / "migrations"
+        audit = (migrations / "000007_pull_audit_integrity.up.sql").read_text(
+            encoding="utf-8"
+        ).lower()
+
+        self.assertIn("create unique index concurrently", audit)
+        self.assertIn("response ->> 'event_id'", audit)
+        self.assertIn("before update or delete", audit)
+        self.assertIn("old.status = 'succeeded'", audit)
+        self.assertIn("pull audit evidence is immutable", audit)
+        self.assertTrue((migrations / "000007_pull_audit_integrity.down.sql").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

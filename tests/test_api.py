@@ -109,6 +109,11 @@ class FixedCatalogRepository:
     async def load_snapshot(self) -> CatalogSnapshot:
         return self.snapshot
 
+    async def load_release_snapshot(self, release_id: str) -> CatalogSnapshot:
+        if self.snapshot.release_id != release_id:
+            raise LookupError(release_id)
+        return self.snapshot
+
     async def close(self) -> None:
         return None
 
@@ -155,6 +160,16 @@ def grouped_catalog_snapshot() -> CatalogSnapshot:
             next_limited.banner.id: next_limited,
             isolated_standard.banner.id: isolated_standard,
         },
+    )
+
+
+def auditable_catalog_snapshot() -> CatalogSnapshot:
+    return replace(
+        grouped_catalog_snapshot(),
+        source="postgres",
+        release_id="d4000000-d4d4-4d4d-8d4d-d4d4d4d4d4d4",
+        release_number=17,
+        snapshot_sha256="f" * 64,
     )
 
 
@@ -611,6 +626,84 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(event.seed, "api-seed")
         self.assertEqual(event.state_version, 1)
         self.assertEqual(event.records, event_publisher.events[0].records)
+
+    def test_pull_audit_binds_and_replays_the_exact_release_configuration(self) -> None:
+        snapshot = auditable_catalog_snapshot()
+        client, _, event_publisher, _ = make_client(
+            catalog_repository=FixedCatalogRepository(snapshot)
+        )
+
+        pull = client.post(
+            "/v1/me/pulls",
+            json={
+                "banner_id": "limited-character-001",
+                "count": 10,
+                "seed": "audit-replay-seed",
+            },
+            headers=HEADERS,
+        )
+
+        self.assertEqual(pull.status_code, 200)
+        payload = pull.json()
+        audit = payload["audit"]
+        self.assertEqual(audit["release_id"], snapshot.release_id)
+        self.assertEqual(audit["release_number"], snapshot.release_number)
+        self.assertEqual(audit["release_snapshot_sha256"], snapshot.snapshot_sha256)
+        self.assertRegex(audit["banner_config_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(audit["rng_algorithm_version"], "wuwa-gacha-rng-v1")
+        self.assertTrue(audit["engine_build_sha"])
+        self.assertEqual(event_publisher.events[0].audit.model_dump(mode="json"), audit)
+
+        verification = client.get(
+            f"/v1/me/pulls/{payload['event_id']}/audit",
+            headers=HEADERS,
+        )
+
+        self.assertEqual(verification.status_code, 200)
+        result = verification.json()
+        self.assertEqual(result["status"], "verified")
+        self.assertTrue(all(result["checks"].values()))
+        self.assertEqual(result["configuration"]["banner_version_id"], audit["banner_version_id"])
+        self.assertEqual(result["recorded_records"], result["replayed_records"])
+        self.assertEqual(result["recorded_next_pity"], result["replayed_next_pity"])
+
+    def test_pull_audit_detects_a_tampered_record(self) -> None:
+        snapshot = auditable_catalog_snapshot()
+        client, state_store, _, _ = make_client(
+            catalog_repository=FixedCatalogRepository(snapshot)
+        )
+        pull = client.post(
+            "/v1/me/pulls",
+            json={
+                "banner_id": "limited-character-001",
+                "count": 10,
+                "seed": "audit-tamper-seed",
+            },
+            headers=HEADERS,
+        )
+        payload = pull.json()
+        operation_key = (UUID(USER_ID), HEADERS["Idempotency-Key"])
+        operation = state_store.operations[operation_key]
+        assert operation.response is not None
+        tampered_record = operation.response.records[0].model_copy(
+            update={"item_id": "tampered-item"}
+        )
+        tampered_response = operation.response.model_copy(
+            update={"records": [tampered_record, *operation.response.records[1:]]}
+        )
+        state_store.operations[operation_key] = operation.model_copy(
+            update={"response": tampered_response}
+        )
+
+        verification = client.get(
+            f"/v1/me/pulls/{payload['event_id']}/audit",
+            headers=HEADERS,
+        )
+
+        self.assertEqual(verification.status_code, 200)
+        result = verification.json()
+        self.assertEqual(result["status"], "mismatch")
+        self.assertFalse(result["checks"]["result_records"])
 
     def test_pull_reuses_succeeded_idempotency_key(self) -> None:
         client, state_store, event_publisher, asset_client = make_client()

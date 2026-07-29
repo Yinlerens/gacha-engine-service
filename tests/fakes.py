@@ -169,6 +169,19 @@ class FakePityStateStore:
         key = self.operation_keys.get(operation_key)
         return self.operations.get(key) if key is not None else None
 
+    async def get_pull_operation_by_event_id(
+        self,
+        *,
+        user_id: UUID,
+        event_id: UUID,
+    ) -> PullOperation | None:
+        for (operation_user_id, _), operation in self.operations.items():
+            if operation_user_id != user_id or operation.response is None:
+                continue
+            if operation.response.event_id == str(event_id):
+                return operation
+        return None
+
     async def compare_and_set_with_pull_operation(
         self,
         *,

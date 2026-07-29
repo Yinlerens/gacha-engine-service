@@ -57,9 +57,13 @@ class CatalogRepositoryTests(unittest.TestCase):
         future_version_id = "22222222-2222-4222-8222-222222222222"
         release_row = {
             "release_id": "d4000000-d4d4-4d4d-8d4d-d4d4d4d4d4d4",
+            "release_number": 17,
+            "snapshot_sha256": "f" * 64,
             "checksum_valid": True,
             "snapshot": {
                 "schema_version": 1,
+                "release_id": "d4000000-d4d4-4d4d-8d4d-d4d4d4d4d4d4",
+                "release_number": 17,
                 "project_id": project_id,
                 "environment_id": environment_id,
                 "items": [
@@ -229,6 +233,9 @@ class CatalogRepositoryTests(unittest.TestCase):
         )
 
         self.assertEqual([banner.id for banner in snapshot.banners], ["banner"])
+        self.assertEqual(snapshot.release_id, release_row["release_id"])
+        self.assertEqual(snapshot.release_number, 17)
+        self.assertEqual(snapshot.snapshot_sha256, "f" * 64)
         self.assertEqual(snapshot.banner_configs_by_id["banner"].version, 1)
         self.assertEqual(
             snapshot.banner_configs_by_id["banner"].banner_version_id,
@@ -551,6 +558,55 @@ class PostgresCatalogRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.banner_configs_by_id, {})
         self.assertEqual(len(connection.fetchrow_calls), 1)
         self.assertEqual(connection.fetchrow_calls[0][1:], (project_id, environment_id))
+
+    async def test_load_release_snapshot_reads_the_exact_immutable_release(self) -> None:
+        project_id = "b2000000-b2b2-4b2b-8b2b-b2b2b2b2b2b2"
+        environment_id = "c3000000-c3c3-4c3c-8c3c-c3c3c3c3c3c3"
+        release_id = "d4000000-d4d4-4d4d-8d4d-d4d4d4d4d4d4"
+        connection = FakeConnection(
+            fetchrow_result={
+                "release_id": release_id,
+                "release_number": 17,
+                "snapshot_sha256": "f" * 64,
+                "checksum_valid": True,
+                "snapshot": {
+                    "schema_version": 1,
+                    "release_id": release_id,
+                    "release_number": 17,
+                    "project_id": project_id,
+                    "environment_id": environment_id,
+                    "items": [],
+                    "banners": [],
+                    "banner_versions": [],
+                    "banner_items": [],
+                    "rarity_rates": [],
+                    "featured_rules": [],
+                    "pity_rules": [],
+                    "rule_sets": [],
+                    "rule_set_rarity_rates": [],
+                    "rule_set_featured_rules": [],
+                    "rule_set_pity_rules": [],
+                },
+            }
+        )
+        repository = PostgresCatalogRepository(
+            database_url="postgres://example",
+            project_id=project_id,
+            environment_id=environment_id,
+            pool_size=1,
+            query_timeout_seconds=1,
+        )
+        repository._pool = FakePool(connection)
+
+        snapshot = await repository.load_release_snapshot(release_id)
+
+        self.assertEqual(snapshot.release_id, release_id)
+        query = str(connection.fetchrow_calls[0][0]).lower()
+        self.assertIn("release.id = $3::uuid", query)
+        self.assertEqual(
+            connection.fetchrow_calls[0][1:],
+            (project_id, environment_id, release_id),
+        )
 
     async def test_load_snapshot_allows_empty_current_catalog(self) -> None:
         connection = FakeConnection(
