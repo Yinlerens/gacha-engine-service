@@ -37,6 +37,9 @@ class Settings:
     asset_service_url: str = "http://asset-service.asset-service.svc.cluster.local"
     asset_internal_token: str = ""
     asset_request_timeout_seconds: int = 5
+    backpack_service_url: str = "http://backpack-service.backpack-service.svc.cluster.local"
+    backpack_internal_token: str = ""
+    backpack_request_timeout_seconds: int = 5
     pending_event_recovery_enabled: bool = True
     pending_event_recovery_interval_seconds: int = 5
     pending_event_recovery_batch_size: int = 100
@@ -97,6 +100,15 @@ class Settings:
             asset_request_timeout_seconds=_int_env(
                 "ASSET_REQUEST_TIMEOUT_SECONDS",
                 cls.asset_request_timeout_seconds,
+            ),
+            backpack_service_url=(
+                os.getenv("BACKPACK_SERVICE_URL", cls.backpack_service_url).strip()
+                or cls.backpack_service_url
+            ),
+            backpack_internal_token=os.getenv("BACKPACK_INTERNAL_TOKEN", "").strip(),
+            backpack_request_timeout_seconds=_int_env(
+                "BACKPACK_REQUEST_TIMEOUT_SECONDS",
+                cls.backpack_request_timeout_seconds,
             ),
             pending_event_recovery_enabled=_bool_env(
                 "PENDING_EVENT_RECOVERY_ENABLED",

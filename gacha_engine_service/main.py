@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from .asset_client import AssetClient, AssetServiceError
+from .backpack_client import BackpackReceiptClient, BackpackReceiptError
 from .auth import authenticate_gateway_request, internal_token_header, user_id_header
 from .catalog_repository import (
     CachedCatalogProvider,
@@ -72,11 +73,13 @@ class AppServices:
         event_publisher: object,
         catalog_provider: object,
         asset_client: object,
+        backpack_receipt_client: object | None = None,
     ) -> None:
         self.state_store = state_store
         self.event_publisher = event_publisher
         self.catalog_provider = catalog_provider
         self.asset_client = asset_client
+        self.backpack_receipt_client = backpack_receipt_client
 
 
 def create_app(
@@ -86,6 +89,7 @@ def create_app(
     event_publisher: object | None = None,
     catalog_repository: CatalogRepository | None = None,
     asset_client: object | None = None,
+    backpack_receipt_client: object | None = None,
 ) -> FastAPI:
     """Create a FastAPI app with injectable external adapters."""
 
@@ -93,6 +97,7 @@ def create_app(
     owns_state_store = state_store is None
     owns_event_publisher = event_publisher is None
     owns_asset_client = asset_client is None
+    owns_backpack_receipt_client = backpack_receipt_client is None
 
     if state_store is None:
         state_store = PostgresGachaStateStore(
@@ -115,6 +120,13 @@ def create_app(
             timeout_seconds=settings.asset_request_timeout_seconds,
         )
 
+    if backpack_receipt_client is None:
+        backpack_receipt_client = BackpackReceiptClient(
+            base_url=settings.backpack_service_url,
+            internal_token=settings.backpack_internal_token or settings.internal_token,
+            timeout_seconds=settings.backpack_request_timeout_seconds,
+        )
+
     catalog_provider = CachedCatalogProvider(
         catalog_repository or create_catalog_repository(settings),
         ttl_seconds=settings.gacha_config_cache_ttl_seconds,
@@ -131,6 +143,7 @@ def create_app(
                         event_publisher,
                         catalog_provider,
                         asset_client,
+                        backpack_receipt_client,
                     ),
                     interval_seconds=settings.pending_event_recovery_interval_seconds,
                     batch_size=settings.pending_event_recovery_batch_size,
@@ -148,6 +161,8 @@ def create_app(
                 except asyncio.CancelledError:
                     pass
             await catalog_provider.close()
+            if owns_backpack_receipt_client and hasattr(backpack_receipt_client, "close"):
+                await backpack_receipt_client.close()
             if owns_asset_client and hasattr(asset_client, "close"):
                 await asset_client.close()
             if owns_event_publisher and hasattr(event_publisher, "close"):
@@ -162,7 +177,13 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = settings
-    app.state.services = AppServices(state_store, event_publisher, catalog_provider, asset_client)
+    app.state.services = AppServices(
+        state_store,
+        event_publisher,
+        catalog_provider,
+        asset_client,
+        backpack_receipt_client,
+    )
 
     register_access_log(app)
     register_exception_handlers(app)
@@ -341,7 +362,7 @@ def register_routes(app: FastAPI) -> None:
             status=operation.status,
             response=(
                 operation.response
-                if operation.status in {"event_pending", "succeeded"}
+                if operation.status in {"event_pending", "event_published", "succeeded"}
                 else None
             ),
             error=operation_error,
@@ -770,7 +791,7 @@ async def handle_claimed_pull_operation(
 ) -> PullResponse:
     if operation.request_hash != request_hash:
         raise state_store_http_exception("pull operation request changed")
-    if operation.status == "succeeded" and operation.response is not None:
+    if operation.status in {"event_published", "succeeded"} and operation.response is not None:
         return operation.response
     if operation.status == "event_pending" and operation.response is not None and operation.event is not None:
         return await publish_and_complete_claimed_pull(
@@ -832,7 +853,7 @@ async def publish_and_complete_claimed_pull(
         await services.state_store.save_pull_operation_by_key(
             operation_key=operation_key,
             operation=PullOperation(
-                status="succeeded",
+                status="event_published",
                 request_hash=request_hash,
                 response=response,
                 event=event,
@@ -1097,7 +1118,7 @@ async def handle_existing_pull_operation(
             },
         )
 
-    if operation.status == "succeeded" and operation.response is not None:
+    if operation.status in {"event_published", "succeeded"} and operation.response is not None:
         return operation.response
 
     if operation.status == "event_pending" and operation.response is not None and operation.event is not None:
@@ -1114,7 +1135,7 @@ async def handle_existing_pull_operation(
             user_id=user_id,
             idempotency_key=idempotency_key,
             operation=PullOperation(
-                status="succeeded",
+                status="event_published",
                 request_hash=request_hash,
                 response=operation.response,
                 event=operation.event,
@@ -1370,7 +1391,7 @@ async def recover_pending_pull_events_once(
     for record in pending_operations:
         operation = record.operation
         if (
-            operation.status != "event_pending"
+            operation.status not in {"event_pending", "event_published"}
             or operation.response is None
             or operation.event is None
         ):
@@ -1380,7 +1401,7 @@ async def recover_pending_pull_events_once(
         try:
             claimed = await services.state_store.claim_pull_operation_recovery(
                 operation_key=record.operation_key,
-                expected_status="event_pending",
+                expected_status=operation.status,
                 lock_ttl_seconds=lock_ttl_seconds,
             )
         except GachaStateStoreError:
@@ -1395,17 +1416,55 @@ async def recover_pending_pull_events_once(
             continue
 
         try:
-            await publish_pull_completed_with_retry(services.event_publisher, operation.event)
-            await services.state_store.save_pull_operation_by_key(
-                operation_key=record.operation_key,
-                operation=PullOperation(
-                    status="succeeded",
-                    request_hash=operation.request_hash,
-                    response=operation.response,
-                    event=operation.event,
-                ),
-            )
+            if operation.status == "event_pending":
+                await publish_pull_completed_with_retry(
+                    services.event_publisher,
+                    operation.event,
+                )
+                await services.state_store.save_pull_operation_by_key(
+                    operation_key=record.operation_key,
+                    operation=PullOperation(
+                        status="event_published",
+                        request_hash=operation.request_hash,
+                        response=operation.response,
+                        event=operation.event,
+                    ),
+                )
+            else:
+                receipt_client = services.backpack_receipt_client
+                if receipt_client is None:
+                    raise BackpackReceiptError(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "backpack_receipt_unconfigured",
+                        "backpack receipt client is not configured",
+                    )
+                reward_applied = await receipt_client.has_pull_event(
+                    user_id=record.user_id,
+                    event_id=UUID(event_id),
+                )
+                if reward_applied:
+                    await services.state_store.save_pull_operation_by_key(
+                        operation_key=record.operation_key,
+                        operation=PullOperation(
+                            status="succeeded",
+                            request_hash=operation.request_hash,
+                            response=operation.response,
+                            event=operation.event,
+                        ),
+                    )
+                else:
+                    await publish_pull_completed_with_retry(
+                        services.event_publisher,
+                        operation.event,
+                    )
             recovered_count += 1
+        except BackpackReceiptError as exc:
+            LOGGER.warning(
+                "failed to verify pull reward receipt event_id=%s status=%s code=%s",
+                event_id,
+                exc.status_code,
+                exc.code,
+            )
         except EventPublishError:
             LOGGER.warning(
                 "failed to recover pending pull event event_id=%s",
@@ -1414,7 +1473,7 @@ async def recover_pending_pull_events_once(
             )
         except GachaStateStoreError:
             LOGGER.warning(
-                "failed to mark recovered pull operation succeeded event_id=%s",
+                "failed to persist recovered pull delivery state event_id=%s",
                 event_id,
                 exc_info=True,
             )

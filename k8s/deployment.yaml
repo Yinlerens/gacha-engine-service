@@ -74,6 +74,13 @@ spec:
                 secretKeyRef:
                   name: gacha-engine-service-secrets
                   key: internal-token
+            - name: BACKPACK_SERVICE_URL
+              value: http://backpack-service.backpack-service.svc.cluster.local
+            - name: BACKPACK_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gacha-engine-service-secrets
+                  key: internal-token
           startupProbe:
             httpGet:
               port: http

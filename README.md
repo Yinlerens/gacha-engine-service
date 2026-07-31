@@ -7,7 +7,7 @@
 1. 从 Supabase/Postgres 或静态兜底配置读取当前卡池
 2. 通过 Asset Service 幂等扣款或退款
 3. 在 Postgres 事务中持久化幂等操作、保底和待发送事件
-4. 把已经提交的完成事件发到 Kafka
+4. 把已经提交的完成事件发到 Kafka，并用 Backpack 持久化回执确认奖励到账
 
 它不负责：
 
@@ -70,6 +70,11 @@ GACHA_CONFIG_POOL_SIZE=2
 GACHA_STATE_QUERY_TIMEOUT_SECONDS=5
 GACHA_STATE_POOL_SIZE=8
 GACHA_ENGINE_BUILD_SHA=<git-commit-sha>
+ASSET_SERVICE_URL=http://asset-service...
+ASSET_INTERNAL_TOKEN=...
+BACKPACK_SERVICE_URL=http://backpack-service...
+BACKPACK_INTERNAL_TOKEN=...
+BACKPACK_REQUEST_TIMEOUT_SECONDS=5
 ```
 
 `GACHA_CONFIG_DATABASE_URL` 为空时使用代码内置静态配置。配置后必须同时提供 `GACHA_PROJECT_ID` 和 `GACHA_ENVIRONMENT_ID`，服务只读取该环境当前发布指针指向的不可变快照，并在快照内选择时间有效的卡池版本。
@@ -84,9 +89,12 @@ psql "$GACHA_STATE_DATABASE_URL" -f migrations/000004_pity_groups_expand.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000005_backfill_pity_groups.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000006_pity_groups_enforce.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000007_pull_audit_integrity.up.sql
+psql "$GACHA_STATE_DATABASE_URL" -f migrations/000008_reward_delivery_confirmation.up.sql
 ```
 
 `000007` 必须先于包含审计功能的 Engine 版本部署。它为 `event_id` 建立在线索引，并保护已经生成的抽卡结果、Kafka 事件和成功记录不被修改或删除。
+
+`000008` 必须先于奖励回执确认版本部署。它新增 `event_published` 状态：Kafka 接受事件后操作仍不是终态，只有 Backpack 在同一数据库事务中保存库存、抽卡批次和出货记录后，Engine 才会把操作标记为 `succeeded`。
 
 生产环境不能清理 `gacha_runtime.pull_operations` 中的幂等键；如需归档响应正文，也必须永久保留 `(user_id, idempotency_key_hash)` 墓碑。
 
@@ -138,13 +146,13 @@ docker compose up --build
 
 Postgres 是抽卡操作、原始响应和保底快照的唯一事实源。幂等记录没有 TTL；缓存故障、切主或淘汰不会把已执行操作变成“未找到”。扣款前会持久化完成本次抽卡所需的冻结配置、种子和事件 ID，但不保存明文 `Idempotency-Key`。处理中请求使用短租约和 fencing token：进程中断后，后台 Worker 会用同一个资产幂等键自动接管，旧进程不能再提交或退款。数据库提交结果不明确时不会猜测退款，而是读取持久化状态继续恢复。
 
-恢复 Worker 同时处理三类非终态：`processing` 自动续跑抽卡，`event_pending` 自动补发 Kafka，`refund_pending` 自动重试退款。扣款、退款和下游事件都使用稳定幂等标识；即使外部调用成功后进程再次中断，下一轮恢复也不会重复扣款或重复入账。操作进入 `succeeded` 或 `failed` 后会清除冻结恢复上下文，只永久保留幂等墓碑和必要的审计结果。
+恢复 Worker 同时处理三类任务：`processing` 自动续跑抽卡，`event_pending` 自动发布 Kafka，`event_published` 查询 Backpack 回执并在未落库时重复投递，`refund_pending` 自动重试退款。扣款、退款和下游事件都使用稳定幂等标识；即使外部调用成功后进程再次中断，下一轮恢复也不会重复扣款或重复入账。`succeeded` 明确表示 Backpack 已持久化同一 `event_id`，而不是仅表示 Kafka 已接收消息。
 
 同一用户在同一卡池并发抽取时，请求可以先读取到相同的保底版本，但只有一个能提交。其他请求会自动读取已提交的新版本、重新计算候选结果并继续提交；持续竞争超过当前处理轮次时保留为 `processing` 交给恢复 Worker，已扣款请求不会因为保底版本竞争而退款。
 
 保底状态按发布配置中的 `pity_group_id` 隔离，而不是按展示用的 `banner_id` 隐式隔离。同一保底组可以跨卡池版本继承，不同组严格分开；旧快照和旧恢复记录缺少该字段时会回退到原 `banner_id`，因此升级不会重置已有保底。修改已投入使用的保底组属于数据迁移，不能只改配置。
 
-`event_pending` 记录同时承担 Outbox 职责，Kafka 恢复任务会按数据库租约重复投递，背包服务再按 `event_id` 去重。
+`event_pending` 记录承担 Outbox 职责；Kafka 确认发布后进入 `event_published`。恢复任务会先查询 Backpack 的持久化回执，未找到时继续投递原始事件，背包服务按 `event_id` 去重；查询失败时保持原状态，不会猜测奖励已经到账。
 
 抽卡响应和 Kafka 事件会带上 `banner_version_id` 与 `pity_group_id`，用于追溯当次抽卡使用的卡池配置版本和保底作用域。审计元数据还会永久绑定 `release_id`、发布快照 SHA-256、规范化卡池配置 SHA-256、RNG 算法版本、Engine 版本和构建 commit。`GET /v1/me/pulls/{event_id}/audit` 会读取指定不可变发布快照，校验全部哈希，并使用原始种子和抽取前保底状态逐抽重放。
 

@@ -17,7 +17,11 @@ services:
       - ./migrations/000001_gacha_runtime_state.up.sql:/docker-entrypoint-initdb.d/000001_gacha_runtime_state.sql:ro
       - ./migrations/000002_pull_processing_lease.up.sql:/docker-entrypoint-initdb.d/000002_pull_processing_lease.sql:ro
       - ./migrations/000003_pull_unattended_recovery.up.sql:/docker-entrypoint-initdb.d/000003_pull_unattended_recovery.sql:ro
+      - ./migrations/000004_pity_groups_expand.up.sql:/docker-entrypoint-initdb.d/000004_pity_groups_expand.sql:ro
+      - ./migrations/000005_backfill_pity_groups.up.sql:/docker-entrypoint-initdb.d/000005_backfill_pity_groups.sql:ro
+      - ./migrations/000006_pity_groups_enforce.up.sql:/docker-entrypoint-initdb.d/000006_pity_groups_enforce.sql:ro
       - ./migrations/000007_pull_audit_integrity.up.sql:/docker-entrypoint-initdb.d/000007_pull_audit_integrity.sql:ro
+      - ./migrations/000008_reward_delivery_confirmation.up.sql:/docker-entrypoint-initdb.d/000008_reward_delivery_confirmation.sql:ro
 
   kafka:
     image: redpandadata/redpanda:v24.3.7
@@ -63,6 +67,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: gacha.pull_completed.v1
       KAFKA_CLIENT_ID: gacha-engine-service
+      BACKPACK_SERVICE_URL: ${BACKPACK_SERVICE_URL:-http://host.docker.internal:8083}
+      BACKPACK_INTERNAL_TOKEN: ${BACKPACK_INTERNAL_TOKEN:-local-dev-token}
     ports:
       - "127.0.0.1:8082:8080"
 

@@ -40,17 +40,24 @@ class FakeConnection:
         self,
         *,
         fetchrow_results: list[dict[str, object] | None] | None = None,
+        fetch_results: list[list[dict[str, object]]] | None = None,
         execute_results: list[str] | None = None,
     ) -> None:
         self.fetchrow_results = list(fetchrow_results or [])
+        self.fetch_results = list(fetch_results or [])
         self.execute_results = list(execute_results or [])
         self.fetchrow_calls: list[tuple[object, ...]] = []
+        self.fetch_calls: list[tuple[object, ...]] = []
         self.execute_calls: list[tuple[object, ...]] = []
         self.transaction_contexts: list[FakeTransaction] = []
 
     async def fetchrow(self, *args: object, **_: object) -> dict[str, object] | None:
         self.fetchrow_calls.append(args)
         return self.fetchrow_results.pop(0)
+
+    async def fetch(self, *args: object, **_: object) -> list[dict[str, object]]:
+        self.fetch_calls.append(args)
+        return self.fetch_results.pop(0) if self.fetch_results else []
 
     async def execute(self, *args: object, **_: object) -> str:
         self.execute_calls.append(args)
@@ -250,7 +257,37 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second)
         claim_call = connection.fetchrow_calls[0]
         self.assertIn("status = $3", str(claim_call[0]).lower())
+        self.assertIn(
+            "status in ('event_pending', 'event_published', 'refund_pending')",
+            str(claim_call[0]).lower(),
+        )
         self.assertEqual(claim_call[3], "refund_pending")
+
+    async def test_delivery_recovery_scan_includes_published_events(self) -> None:
+        connection = FakeConnection()
+        store = make_store(connection)
+
+        records = await store.iter_event_pending_pull_operations(limit=25)
+
+        self.assertEqual(records, [])
+        scan_call = connection.fetch_calls[0]
+        self.assertIn(
+            "status in ('event_pending', 'event_published')",
+            str(scan_call[0]).lower(),
+        )
+        self.assertEqual(scan_call[1], 25)
+
+    async def test_recovery_lock_release_does_not_touch_terminal_audit_rows(self) -> None:
+        connection = FakeConnection()
+        store = make_store(connection)
+
+        await store.release_pull_operation_recovery(operation_key=str(OPERATION_ID))
+
+        release_call = connection.execute_calls[0]
+        self.assertIn(
+            "status in ('event_pending', 'event_published', 'refund_pending')",
+            str(release_call[0]).lower(),
+        )
 
     async def test_begin_pull_operation_does_not_take_an_active_lease(self) -> None:
         context = recovery_context()

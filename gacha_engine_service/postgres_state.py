@@ -745,7 +745,7 @@ SELECT_PENDING_OPERATIONS_SQL = """
 select id, user_id, status, request_hash, response, event, error_code,
        error_message, processing_token, recovery_context
 from gacha_runtime.pull_operations
-where status = 'event_pending'
+where status in ('event_pending', 'event_published')
 order by updated_at, id
 limit $1
 """
@@ -790,7 +790,7 @@ set recovery_locked_until = now() + make_interval(secs => $2),
     updated_at = now()
 where id = $1
   and status = $3
-  and status in ('event_pending', 'refund_pending')
+  and status in ('event_pending', 'event_published', 'refund_pending')
   and (recovery_locked_until is null or recovery_locked_until < now())
 returning id
 """
@@ -800,4 +800,5 @@ update gacha_runtime.pull_operations
 set recovery_locked_until = null,
     updated_at = now()
 where id = $1
+  and status in ('event_pending', 'event_published', 'refund_pending')
 """

@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from gacha_engine_service.asset_client import AssetServiceError
+from gacha_engine_service.backpack_client import BackpackReceiptError
 from gacha_engine_service.catalog_config import (
     CatalogSnapshot,
     ScheduledBannerConfig,
@@ -53,16 +54,19 @@ def make_client(
     state_store: FakePityStateStore | None = None,
     event_publisher: FakeEventPublisher | None = None,
     asset_client: FakeAssetClient | None = None,
+    backpack_receipt_client: FakeBackpackReceiptClient | None = None,
     catalog_repository: object | None = None,
 ) -> tuple[TestClient, FakePityStateStore, FakeEventPublisher, FakeAssetClient]:
     state_store = state_store or FakePityStateStore()
     event_publisher = event_publisher or FakeEventPublisher()
     asset_client = asset_client or FakeAssetClient()
+    backpack_receipt_client = backpack_receipt_client or FakeBackpackReceiptClient()
     app = create_app(
         settings=Settings(internal_token="test-token"),
         state_store=state_store,
         event_publisher=event_publisher,
         asset_client=asset_client,
+        backpack_receipt_client=backpack_receipt_client,
         catalog_repository=catalog_repository,
     )
     return TestClient(app), state_store, event_publisher, asset_client
@@ -1305,8 +1309,13 @@ class ApiTests(unittest.TestCase):
         )
         event_publisher.publish_error = False
 
-        services = AppServices(state_store, event_publisher, object(), asset_client)
-        services.backpack_receipt_client = receipt_client
+        services = AppServices(
+            state_store,
+            event_publisher,
+            object(),
+            asset_client,
+            receipt_client,
+        )
         published_count = asyncio.run(
             recover_pending_pull_events_once(
                 services,
@@ -1331,6 +1340,7 @@ class ApiTests(unittest.TestCase):
                 lock_ttl_seconds=30,
             )
         )
+        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual((published_count, replayed_count, confirmed_count), (1, 1, 1))
@@ -1339,6 +1349,58 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(operation.status, "succeeded")
         self.assertIsNotNone(operation.response)
         self.assertIsNotNone(operation.event)
+
+    def test_pending_event_recovery_does_not_infer_success_when_receipt_check_fails(self) -> None:
+        event_publisher = FakeEventPublisher(publish_error=True)
+        client, state_store, event_publisher, asset_client = make_client(
+            event_publisher=event_publisher,
+        )
+        receipt_client = FakeBackpackReceiptClient(
+            error=BackpackReceiptError(
+                503,
+                "database_unavailable",
+                "backpack database is unavailable",
+            )
+        )
+
+        response = client.post(
+            "/v1/me/pulls",
+            json={
+                "banner_id": "limited-character-001",
+                "count": 1,
+                "seed": "receipt-check-failure",
+            },
+            headers=HEADERS,
+        )
+        event_publisher.publish_error = False
+        services = AppServices(
+            state_store,
+            event_publisher,
+            object(),
+            asset_client,
+            receipt_client,
+        )
+
+        published_count = asyncio.run(
+            recover_pending_pull_events_once(
+                services,
+                limit=10,
+                lock_ttl_seconds=30,
+            )
+        )
+        checked_count = asyncio.run(
+            recover_pending_pull_events_once(
+                services,
+                limit=10,
+                lock_ttl_seconds=30,
+            )
+        )
+
+        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual((published_count, checked_count), (1, 0))
+        self.assertEqual(operation.status, "event_published")
+        self.assertEqual(len(receipt_client.queries), 1)
 
     def test_get_pity_returns_initial_snapshot(self) -> None:
         client, _, _, _ = make_client(

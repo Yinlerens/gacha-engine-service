@@ -144,6 +144,7 @@ class PullOperationStateResponse(BaseModel):
     status: Literal[
         "processing",
         "event_pending",
+        "event_published",
         "succeeded",
         "refund_pending",
         "failed",
