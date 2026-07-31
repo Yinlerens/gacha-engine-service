@@ -197,6 +197,24 @@ class PostgresGachaStateStore:
         except Exception as exc:
             raise GachaStateStoreError("read pull operation by key failed") from exc
 
+    async def get_pull_operation_by_event_id(
+        self,
+        *,
+        user_id: UUID,
+        event_id: UUID,
+    ) -> PullOperation | None:
+        pool = await self._ensure_pool()
+        try:
+            async with pool.acquire() as connection:
+                row = await connection.fetchrow(
+                    SELECT_PULL_OPERATION_BY_EVENT_ID_SQL,
+                    user_id,
+                    str(event_id),
+                )
+                return _operation_from_row(row) if row is not None else None
+        except Exception as exc:
+            raise GachaStateStoreError("read pull operation by event id failed") from exc
+
     async def compare_and_set_with_pull_operation(
         self,
         *,
@@ -653,6 +671,15 @@ select id, user_id, status, request_hash, response, event, error_code,
        error_message, processing_token, recovery_context
 from gacha_runtime.pull_operations
 where id = $1
+"""
+
+SELECT_PULL_OPERATION_BY_EVENT_ID_SQL = """
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context
+from gacha_runtime.pull_operations
+where user_id = $1
+  and response ->> 'event_id' = $2
+limit 1
 """
 
 SELECT_PULL_OPERATION_BY_ID_FOR_UPDATE_SQL = """

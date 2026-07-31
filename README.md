@@ -24,6 +24,7 @@ GET /v1/banners
 GET /v1/items
 GET /v1/me/pity?banner_id=limited-character-001
 GET /v1/me/pulls/operation
+GET /v1/me/pulls/{event_id}/audit
 POST /v1/me/pulls
 ```
 
@@ -43,6 +44,7 @@ POST /v1/me/pulls
 X-Internal-Token: <internal-token>
 X-User-Id: <uuid>
 Idempotency-Key: <pull-operation-id>
+X-Request-Accepted-At: <gateway-rfc3339-timestamp>
 ```
 
 客户端在 `POST /v1/me/pulls` 超时或结果不确定时，应保留原请求参数和
@@ -67,6 +69,7 @@ GACHA_CONFIG_QUERY_TIMEOUT_SECONDS=5
 GACHA_CONFIG_POOL_SIZE=2
 GACHA_STATE_QUERY_TIMEOUT_SECONDS=5
 GACHA_STATE_POOL_SIZE=8
+GACHA_ENGINE_BUILD_SHA=<git-commit-sha>
 ```
 
 `GACHA_CONFIG_DATABASE_URL` 为空时使用代码内置静态配置。配置后必须同时提供 `GACHA_PROJECT_ID` 和 `GACHA_ENVIRONMENT_ID`，服务只读取该环境当前发布指针指向的不可变快照，并在快照内选择时间有效的卡池版本。
@@ -80,7 +83,10 @@ psql "$GACHA_STATE_DATABASE_URL" -f migrations/000003_pull_unattended_recovery.u
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000004_pity_groups_expand.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000005_backfill_pity_groups.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000006_pity_groups_enforce.up.sql
+psql "$GACHA_STATE_DATABASE_URL" -f migrations/000007_pull_audit_integrity.up.sql
 ```
+
+`000007` 必须先于包含审计功能的 Engine 版本部署。它为 `event_id` 建立在线索引，并保护已经生成的抽卡结果、Kafka 事件和成功记录不被修改或删除。
 
 生产环境不能清理 `gacha_runtime.pull_operations` 中的幂等键；如需归档响应正文，也必须永久保留 `(user_id, idempotency_key_hash)` 墓碑。
 
@@ -140,7 +146,7 @@ Postgres 是抽卡操作、原始响应和保底快照的唯一事实源。幂�
 
 `event_pending` 记录同时承担 Outbox 职责，Kafka 恢复任务会按数据库租约重复投递，背包服务再按 `event_id` 去重。
 
-抽卡响应和 Kafka 事件会带上 `banner_version_id` 与 `pity_group_id`，用于追溯当次抽卡使用的卡池配置版本和保底作用域。
+抽卡响应和 Kafka 事件会带上 `banner_version_id` 与 `pity_group_id`，用于追溯当次抽卡使用的卡池配置版本和保底作用域。审计元数据还会永久绑定 `release_id`、发布快照 SHA-256、规范化卡池配置 SHA-256、RNG 算法版本、Engine 版本和构建 commit。`GET /v1/me/pulls/{event_id}/audit` 会读取指定不可变发布快照，校验全部哈希，并使用原始种子和抽取前保底状态逐抽重放。
 
 网关接入时，把公开路径 `/api/v1/gacha` 转发到服务内的 `/v1`：
 

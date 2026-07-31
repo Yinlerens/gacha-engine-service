@@ -18,6 +18,7 @@ class Settings:
 
     app_name: str = "Gacha Engine Service"
     app_version: str = __version__
+    engine_build_sha: str = "development"
     host: str = "127.0.0.1"
     port: int = 8080
     internal_token: str = ""
@@ -51,6 +52,10 @@ class Settings:
         )
 
         return cls(
+            engine_build_sha=(
+                os.getenv("GACHA_ENGINE_BUILD_SHA", cls.engine_build_sha).strip()
+                or cls.engine_build_sha
+            ),
             host=os.getenv("HOST", cls.host).strip() or cls.host,
             port=_int_env("PORT", cls.port),
             internal_token=os.getenv("INTERNAL_TOKEN", "").strip(),

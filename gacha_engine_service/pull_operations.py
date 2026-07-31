@@ -10,7 +10,13 @@ from uuid import UUID
 from pydantic import BaseModel, Field, model_validator
 
 from .catalog_config import BannerConfig, FeaturedRule, PityRule, RarityRate
-from .schemas import Banner, GachaItem, PullCompletedEvent, PullResponse
+from .schemas import (
+    Banner,
+    GachaItem,
+    PullAuditMetadata,
+    PullCompletedEvent,
+    PullResponse,
+)
 
 
 PullOperationStatus = Literal[
@@ -64,6 +70,7 @@ class PullRecoveryContext(BaseModel):
     amount_minor: int = Field(gt=0)
     request_id: str = ""
     accepted_at: datetime | None = None
+    audit: PullAuditMetadata | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -91,6 +98,7 @@ class PullRecoveryContext(BaseModel):
         amount_minor: int,
         request_id: str,
         accepted_at: datetime | None = None,
+        audit: PullAuditMetadata | None = None,
     ) -> PullRecoveryContext:
         return cls(
             banner=banner_config.banner,
@@ -138,6 +146,7 @@ class PullRecoveryContext(BaseModel):
             amount_minor=amount_minor,
             request_id=request_id,
             accepted_at=accepted_at,
+            audit=audit,
         )
 
     def to_banner_config(self) -> BannerConfig:

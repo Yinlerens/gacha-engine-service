@@ -26,6 +26,9 @@ class CatalogRepository(Protocol):
     async def load_snapshot(self) -> CatalogSnapshot:
         """Load the current catalog snapshot."""
 
+    async def load_release_snapshot(self, release_id: str) -> CatalogSnapshot:
+        """Load one immutable historical release."""
+
     async def close(self) -> None:
         """Close repository resources."""
 
@@ -33,6 +36,9 @@ class CatalogRepository(Protocol):
 class StaticCatalogRepository:
     async def load_snapshot(self) -> CatalogSnapshot:
         return static_catalog_snapshot()
+
+    async def load_release_snapshot(self, release_id: str) -> CatalogSnapshot:
+        raise CatalogLoadError(f"static catalog has no release {release_id}")
 
     async def close(self) -> None:
         return None
@@ -59,6 +65,11 @@ class CachedCatalogProvider:
 
     async def ping(self) -> None:
         await self.get_snapshot()
+
+    async def get_release_snapshot(self, release_id: str) -> CatalogSnapshot:
+        if self._snapshot is not None and self._snapshot.release_id == release_id:
+            return self._snapshot
+        return await self._repository.load_release_snapshot(release_id)
 
     async def close(self) -> None:
         await self._repository.close()
@@ -101,6 +112,30 @@ class PostgresCatalogRepository:
         except Exception as exc:
             raise CatalogLoadError("load gacha catalog from postgres failed") from exc
 
+        return _build_snapshot_from_release(
+            release_row,
+            expected_project_id=self._project_id,
+            expected_environment_id=self._environment_id,
+        )
+
+    async def load_release_snapshot(self, release_id: str) -> CatalogSnapshot:
+        pool = await self._ensure_pool()
+        try:
+            async with pool.acquire() as connection:
+                release_row = await connection.fetchrow(
+                    RELEASE_BY_ID_SQL,
+                    self._project_id,
+                    self._environment_id,
+                    release_id,
+                    timeout=self._query_timeout_seconds,
+                )
+        except CatalogLoadError:
+            raise
+        except Exception as exc:
+            raise CatalogLoadError("load historical gacha release failed") from exc
+
+        if release_row is None:
+            raise CatalogLoadError(f"gacha release {release_id} was not found")
         return _build_snapshot_from_release(
             release_row,
             expected_project_id=self._project_id,
@@ -159,6 +194,23 @@ def _build_snapshot_from_release(
     if str(payload.get("environment_id", "")).lower() != expected_environment_id.lower():
         raise CatalogLoadError("gacha release environment does not match configured environment")
 
+    release_id = str(release_row["release_id"])
+    release_number_value = _optional_row_value(release_row, "release_number")
+    release_number = (
+        int(release_number_value)
+        if release_number_value is not None
+        else int(payload["release_number"])
+        if payload.get("release_number") is not None
+        else None
+    )
+    snapshot_sha256_value = _optional_row_value(release_row, "snapshot_sha256")
+    snapshot_sha256 = (
+        str(snapshot_sha256_value) if snapshot_sha256_value is not None else None
+    )
+    embedded_release_id = payload.get("release_id")
+    if embedded_release_id is not None and str(embedded_release_id) != release_id:
+        raise CatalogLoadError("gacha release identity does not match its snapshot")
+
     item_rows = _release_array(payload, "items")
     banners_by_id = {
         str(row["id"]): row
@@ -211,6 +263,9 @@ def _build_snapshot_from_release(
         rule_set_featured_rows=_release_array(payload, "rule_set_featured_rules"),
         rule_set_pity_rows=_release_array(payload, "rule_set_pity_rules"),
         effective_at=effective_at,
+        release_id=release_id,
+        release_number=release_number,
+        snapshot_sha256=snapshot_sha256,
     )
 
 
@@ -260,6 +315,9 @@ def _build_snapshot(
     rule_set_featured_rows: list[Any] | None = None,
     rule_set_pity_rows: list[Any] | None = None,
     effective_at: datetime | None = None,
+    release_id: str | None = None,
+    release_number: int | None = None,
+    snapshot_sha256: str | None = None,
 ) -> CatalogSnapshot:
     snapshot_time = effective_at or datetime.now(timezone.utc)
     items = tuple(_item_from_row(row) for row in item_rows)
@@ -412,6 +470,9 @@ def _build_snapshot(
         banners=tuple(banners),
         banner_configs_by_id=configs,
         banner_schedules_by_id=ordered_schedules,
+        release_id=release_id,
+        release_number=release_number,
+        snapshot_sha256=snapshot_sha256,
     )
 
 
@@ -529,6 +590,8 @@ def _json_object(value: Any) -> dict[str, Any]:
 CURRENT_RELEASE_SQL = """
 select
   release.id::text as release_id,
+  release.release_number,
+  release.snapshot_sha256,
   release.snapshot,
   release.snapshot_sha256 = encode(
     extensions.digest(release.snapshot::text, 'sha256'),
@@ -538,7 +601,24 @@ from gacha.environment_release_heads head
 join gacha.releases release
   on release.id = head.release_id
  and release.project_id = head.project_id
- and release.environment_id = head.environment_id
+  and release.environment_id = head.environment_id
 where head.project_id = $1::uuid
   and head.environment_id = $2::uuid
+"""
+
+
+RELEASE_BY_ID_SQL = """
+select
+  release.id::text as release_id,
+  release.release_number,
+  release.snapshot_sha256,
+  release.snapshot,
+  release.snapshot_sha256 = encode(
+    extensions.digest(release.snapshot::text, 'sha256'),
+    'hex'
+  ) as checksum_valid
+from gacha.releases release
+where release.project_id = $1::uuid
+  and release.environment_id = $2::uuid
+  and release.id = $3::uuid
 """

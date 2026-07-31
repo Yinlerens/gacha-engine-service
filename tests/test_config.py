@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -50,6 +51,27 @@ class SettingsTests(unittest.TestCase):
             settings.gacha_environment_id,
             "c3000000-c3c3-4c3c-8c3c-c3c3c3c3c3c3",
         )
+
+    def test_from_env_records_the_deployed_engine_build(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"GACHA_ENGINE_BUILD_SHA": "a" * 40},
+            clear=True,
+        ):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.engine_build_sha, "a" * 40)
+
+    def test_container_build_embeds_the_source_revision_without_ci_loop(self) -> None:
+        root = Path(__file__).parents[1]
+        dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+        workflow = (
+            root / ".github" / "workflows" / "container-image.yaml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ARG GACHA_ENGINE_BUILD_SHA", dockerfile)
+        self.assertIn("GACHA_ENGINE_BUILD_SHA=${{ github.sha }}", workflow)
+        self.assertIn("chore: update image digest [skip ci]", workflow)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from .schemas import GachaItem, GachaRarity, PityState, PullRecord
 
 
 PULL_RECORD_NAMESPACE = uuid.UUID("526b8ca6-8e43-4c6e-a1a6-1373927f45f4")
+RNG_ALGORITHM_VERSION = "wuwa-gacha-rng-v1"
 
 
 def create_initial_pity() -> PityState:

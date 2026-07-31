@@ -17,6 +17,7 @@ services:
       - ./migrations/000001_gacha_runtime_state.up.sql:/docker-entrypoint-initdb.d/000001_gacha_runtime_state.sql:ro
       - ./migrations/000002_pull_processing_lease.up.sql:/docker-entrypoint-initdb.d/000002_pull_processing_lease.sql:ro
       - ./migrations/000003_pull_unattended_recovery.up.sql:/docker-entrypoint-initdb.d/000003_pull_unattended_recovery.sql:ro
+      - ./migrations/000007_pull_audit_integrity.up.sql:/docker-entrypoint-initdb.d/000007_pull_audit_integrity.sql:ro
 
   kafka:
     image: redpandadata/redpanda:v24.3.7

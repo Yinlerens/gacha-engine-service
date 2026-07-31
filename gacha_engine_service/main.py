@@ -28,12 +28,15 @@ from .config import Settings
 from .engine import perform_pulls
 from .kafka_events import EventPublishError, KafkaEventPublisher
 from .postgres_state import PostgresGachaStateStore
+from .pull_audit import build_pull_audit_metadata, verify_pull_response
 from .pull_operations import PullOperation, PullRecoveryContext
 from .schemas import (
     ApiError,
     ErrorResponse,
     HealthResponse,
     PitySnapshot,
+    PullAuditMetadata,
+    PullAuditVerificationResponse,
     PullCompletedEvent,
     PullOperationStateResponse,
     PullRequest,
@@ -344,6 +347,58 @@ def register_routes(app: FastAPI) -> None:
             error=operation_error,
         )
 
+    @app.get(
+        "/v1/me/pulls/{event_id}/audit",
+        response_model=PullAuditVerificationResponse,
+        tags=["gacha"],
+    )
+    async def audit_pull(
+        event_id: UUID,
+        request: Request,
+        user_id: UUID = Depends(current_user_id),
+    ) -> PullAuditVerificationResponse:
+        services: AppServices = request.app.state.services
+        try:
+            operation = await services.state_store.get_pull_operation_by_event_id(
+                user_id=user_id,
+                event_id=event_id,
+            )
+        except GachaStateStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "state_store_unavailable",
+                    "message": "pull audit evidence is unavailable",
+                },
+            ) from exc
+
+        if operation is None or operation.response is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "pull_audit_not_found",
+                    "message": "pull audit evidence was not found",
+                },
+            )
+
+        audit = operation.response.audit
+        try:
+            snapshot = (
+                await services.catalog_provider.get_release_snapshot(audit.release_id)
+                if audit is not None and audit.release_id is not None
+                else await services.catalog_provider.get_snapshot()
+            )
+        except CatalogLoadError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "pull_audit_release_unavailable",
+                    "message": "recorded gacha release is unavailable",
+                },
+            ) from exc
+
+        return verify_pull_response(operation.response, snapshot)
+
     @app.post("/v1/me/pulls", response_model=PullResponse, tags=["gacha"])
     async def create_pull(
         pull_request: PullRequest,
@@ -403,6 +458,22 @@ def register_routes(app: FastAPI) -> None:
 
         cost_minor = pull_request.count * ASTRITE_PER_PULL
         event_id = deterministic_pull_event_id(user_id, idempotency_key)
+        settings: Settings = request.app.state.settings
+        try:
+            audit = build_pull_audit_metadata(
+                snapshot=snapshot,
+                config=banner_config,
+                engine_version=settings.app_version,
+                engine_build_sha=settings.engine_build_sha,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "gacha_config_evidence_missing",
+                    "message": "gacha configuration audit evidence is incomplete",
+                },
+            ) from exc
         recovery_context = PullRecoveryContext.from_banner_config(
             banner_config=banner_config,
             count=pull_request.count,
@@ -411,6 +482,7 @@ def register_routes(app: FastAPI) -> None:
             amount_minor=cost_minor,
             request_id=request_id,
             accepted_at=accepted_at,
+            audit=audit,
         )
         return await claim_or_resume_pull(
             services=services,
@@ -465,6 +537,7 @@ async def claim_or_resume_pull(
                 pity_group_id=claimed_context.pity_group_id,
                 banner_version_id=claimed_context.banner_version_id,
                 count=claimed_context.count,
+                audit=claimed_context.audit,
             ),
         )
 
@@ -499,6 +572,7 @@ async def execute_claimed_pull(
         pity_group_id=context.pity_group_id,
         banner_version_id=context.banner_version_id,
         count=context.count,
+        audit=context.audit,
     )
 
     try:
@@ -629,6 +703,7 @@ async def generate_and_commit_pull_with_retry(
             previous_pity=previous_pity,
             next_pity=next_pity,
             state_version=next_pity.version,
+            audit=context.audit,
         )
         event = PullCompletedEvent(
             event_id=event_id,
@@ -642,6 +717,7 @@ async def generate_and_commit_pull_with_retry(
             previous_pity=previous_pity,
             next_pity=next_pity,
             state_version=next_pity.version,
+            audit=context.audit,
         )
 
         try:
@@ -969,6 +1045,15 @@ async def handle_existing_pull_request(
         if event is not None
         else pull_request.banner_id
     )
+    audit = (
+        context.audit
+        if context is not None
+        else response.audit
+        if response is not None
+        else event.audit
+        if event is not None
+        else None
+    )
     count = context.count if context is not None else pull_request.count
     amount_minor = context.amount_minor if context is not None else count * ASTRITE_PER_PULL
     return await handle_existing_pull_operation(
@@ -986,6 +1071,7 @@ async def handle_existing_pull_request(
             pity_group_id=pity_group_id,
             banner_version_id=banner_version_id,
             count=count,
+            audit=audit,
         ),
     )
 
@@ -1394,6 +1480,7 @@ async def recover_pending_pull_refunds_once(
             pity_group_id=context.pity_group_id,
             banner_version_id=context.banner_version_id,
             count=context.count,
+            audit=context.audit,
         )
         try:
             await refund_claimed_spend(
@@ -1519,6 +1606,7 @@ def pull_asset_metadata(
     pity_group_id: str,
     banner_version_id: str | None,
     count: int,
+    audit: PullAuditMetadata | None = None,
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
         "source": "gacha-engine-service",
@@ -1530,6 +1618,22 @@ def pull_asset_metadata(
     }
     if banner_version_id is not None:
         metadata["banner_version_id"] = banner_version_id
+    if audit is not None:
+        metadata.update(
+            {
+                "audit_schema_version": audit.schema_version,
+                "banner_config_sha256": audit.banner_config_sha256,
+                "rng_algorithm_version": audit.rng_algorithm_version,
+                "engine_version": audit.engine_version,
+                "engine_build_sha": audit.engine_build_sha,
+            }
+        )
+        if audit.release_id is not None:
+            metadata["release_id"] = audit.release_id
+        if audit.release_number is not None:
+            metadata["release_number"] = audit.release_number
+        if audit.release_snapshot_sha256 is not None:
+            metadata["release_snapshot_sha256"] = audit.release_snapshot_sha256
     return metadata
 
 

@@ -90,6 +90,8 @@ jobs:
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            GACHA_ENGINE_BUILD_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -158,6 +160,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: update image digest"
+          git commit -m "chore: update image digest [skip ci]"
           git push
-

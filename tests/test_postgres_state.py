@@ -315,6 +315,20 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pity_group_id = $2", str(select_call[0]).lower())
         self.assertEqual(select_call[2], "limited-character-shared")
 
+    async def test_pull_audit_lookup_uses_user_and_event_id(self) -> None:
+        connection = FakeConnection(fetchrow_results=[None])
+        store = make_store(connection)
+
+        operation = await store.get_pull_operation_by_event_id(
+            user_id=USER_ID,
+            event_id=UUID(EVENT_ID),
+        )
+
+        self.assertIsNone(operation)
+        select_call = connection.fetchrow_calls[0]
+        self.assertIn("response ->> 'event_id' = $2", str(select_call[0]).lower())
+        self.assertEqual(select_call[1:], (USER_ID, EVENT_ID))
+
     async def test_stale_processing_owner_is_fenced_before_pity_commit(self) -> None:
         connection = FakeConnection(fetchrow_results=[operation_row()])
         store = make_store(connection)
@@ -402,6 +416,7 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("response ->> 'event_id'", audit)
         self.assertIn("before update or delete", audit)
         self.assertIn("old.status = 'succeeded'", audit)
+        self.assertIn("new.status not in ('event_pending', 'succeeded')", audit)
         self.assertIn("pull audit evidence is immutable", audit)
         self.assertTrue((migrations / "000007_pull_audit_integrity.down.sql").exists())
 

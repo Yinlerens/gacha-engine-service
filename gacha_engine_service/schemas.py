@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -99,6 +99,21 @@ class PullRecord(BaseModel):
     is_featured: bool
 
 
+class PullAuditMetadata(BaseModel):
+    schema_version: Literal[1] = 1
+    release_id: str | None = None
+    release_number: int | None = Field(default=None, ge=1)
+    release_snapshot_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    banner_version_id: str | None = None
+    banner_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rng_algorithm_version: str
+    engine_version: str
+    engine_build_sha: str
+
+
 class PullResponse(BaseModel):
     event_id: str
     accepted_at: datetime | None = None
@@ -109,6 +124,20 @@ class PullResponse(BaseModel):
     previous_pity: PitySnapshot
     next_pity: PitySnapshot
     state_version: int
+    audit: PullAuditMetadata | None = None
+
+
+class PullAuditVerificationResponse(BaseModel):
+    event_id: str
+    status: Literal["verified", "mismatch", "unverifiable"]
+    audit: PullAuditMetadata | None = None
+    checks: dict[str, bool] = Field(default_factory=dict)
+    mismatches: list[str] = Field(default_factory=list)
+    configuration: dict[str, Any] | None = None
+    recorded_records: list[PullRecord] = Field(default_factory=list)
+    replayed_records: list[PullRecord] | None = None
+    recorded_next_pity: PitySnapshot | None = None
+    replayed_next_pity: PitySnapshot | None = None
 
 
 class PullOperationStateResponse(BaseModel):
@@ -136,3 +165,4 @@ class PullCompletedEvent(BaseModel):
     previous_pity: PitySnapshot
     next_pity: PitySnapshot
     state_version: int
+    audit: PullAuditMetadata | None = None

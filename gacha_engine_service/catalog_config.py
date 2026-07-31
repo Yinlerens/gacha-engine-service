@@ -119,6 +119,9 @@ class CatalogSnapshot:
     banner_schedules_by_id: Mapping[str, tuple[ScheduledBannerConfig, ...]] = field(
         default_factory=dict
     )
+    release_id: str | None = None
+    release_number: int | None = None
+    snapshot_sha256: str | None = None
 
     def banner_config_at(
         self,
