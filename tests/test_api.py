@@ -192,6 +192,25 @@ class ApiTests(unittest.TestCase):
         self.assertIn("x-request-id", response.headers)
         self.assertEqual(response.json(), {"status": "ok"})
 
+    def test_probe_endpoints_do_not_emit_access_logs(self) -> None:
+        client, _, _, _ = make_client()
+
+        with self.assertNoLogs("gacha_engine_service.main", level="INFO"):
+            for path in ("/health", "/ready"):
+                response = client.get(path)
+                self.assertEqual(response.status_code, 200)
+
+    def test_business_endpoint_still_emits_access_log(self) -> None:
+        client, _, _, _ = make_client()
+
+        with self.assertLogs("gacha_engine_service.main", level="INFO") as captured:
+            response = client.get("/v1/banners")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            any("http request" in message for message in captured.output)
+        )
+
     def test_pull_requires_trusted_gateway_accepted_at(self) -> None:
         client, _, _, _ = make_client()
         headers = {key: value for key, value in HEADERS.items() if key != "X-Request-Accepted-At"}
