@@ -248,7 +248,7 @@ class FakePityStateStore:
     async def iter_event_pending_pull_operations(self, *, limit: int) -> list[PullOperationRecord]:
         records: list[PullOperationRecord] = []
         for (user_id, idempotency_key), operation in self.operations.items():
-            if operation.status != "event_pending":
+            if operation.status not in {"event_pending", "event_published"}:
                 continue
             records.append(
                 PullOperationRecord(
@@ -365,6 +365,24 @@ class FakeEventPublisher:
         if self.publish_error:
             raise EventPublishError("failed to publish pull event")
         self.events.append(event)
+
+
+class FakeBackpackReceiptClient:
+    def __init__(
+        self,
+        *,
+        applied_event_ids: set[str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.applied_event_ids = applied_event_ids or set()
+        self.error = error
+        self.queries: list[tuple[UUID, UUID]] = []
+
+    async def has_pull_event(self, *, user_id: UUID, event_id: UUID) -> bool:
+        self.queries.append((user_id, event_id))
+        if self.error is not None:
+            raise self.error
+        return str(event_id) in self.applied_event_ids
 
 
 class FakeAssetClient:

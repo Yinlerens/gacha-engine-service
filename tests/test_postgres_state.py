@@ -420,6 +420,20 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pull audit evidence is immutable", audit)
         self.assertTrue((migrations / "000007_pull_audit_integrity.down.sql").exists())
 
+    def test_reward_delivery_migration_adds_a_confirmable_published_state(self) -> None:
+        migrations = Path(__file__).parents[1] / "migrations"
+        delivery = (
+            migrations / "000008_reward_delivery_confirmation.up.sql"
+        ).read_text(encoding="utf-8").lower()
+
+        self.assertIn("'event_published'", delivery)
+        self.assertIn("status in ('event_pending', 'event_published')", delivery)
+        self.assertIn("old.status in ('event_pending', 'event_published')", delivery)
+        self.assertIn("new.status not in (old.status, 'event_published', 'succeeded')", delivery)
+        self.assertTrue(
+            (migrations / "000008_reward_delivery_confirmation.down.sql").exists()
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

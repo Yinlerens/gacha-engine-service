@@ -62,6 +62,22 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.engine_build_sha, "a" * 40)
 
+    def test_from_env_loads_backpack_receipt_dependency(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "BACKPACK_SERVICE_URL": "http://backpack.internal",
+                "BACKPACK_INTERNAL_TOKEN": "backpack-token",
+                "BACKPACK_REQUEST_TIMEOUT_SECONDS": "7",
+            },
+            clear=True,
+        ):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.backpack_service_url, "http://backpack.internal")
+        self.assertEqual(settings.backpack_internal_token, "backpack-token")
+        self.assertEqual(settings.backpack_request_timeout_seconds, 7)
+
     def test_container_build_embeds_the_source_revision_without_ci_loop(self) -> None:
         root = Path(__file__).parents[1]
         dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")

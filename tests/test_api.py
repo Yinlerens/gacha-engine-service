@@ -29,7 +29,12 @@ from gacha_engine_service.postgres_state import PostgresGachaStateStore
 from gacha_engine_service.pull_operations import PullOperation, PullRecoveryContext
 from gacha_engine_service.schemas import PitySnapshot
 
-from .fakes import FakeAssetClient, FakeEventPublisher, FakePityStateStore
+from .fakes import (
+    FakeAssetClient,
+    FakeBackpackReceiptClient,
+    FakeEventPublisher,
+    FakePityStateStore,
+)
 
 
 USER_ID = "ae6b9d2e-9bb0-42c7-950f-c38ab6d7195e"
@@ -461,7 +466,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(
             response.json(),
             {
-                "status": "succeeded",
+                "status": "event_published",
                 "response": pull_response.json(),
                 "error": None,
             },
@@ -512,6 +517,10 @@ class ApiTests(unittest.TestCase):
             (
                 completed_operation.model_copy(update={"status": "event_pending"}),
                 {"status": "event_pending", "response": created.json(), "error": None},
+            ),
+            (
+                completed_operation.model_copy(update={"status": "event_published"}),
+                {"status": "event_published", "response": created.json(), "error": None},
             ),
             (
                 PullOperation(
@@ -814,7 +823,7 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(completed_but_unseen.status_code, 200)
         self.assertEqual(operation.status_code, 200)
-        self.assertEqual(operation.json()["status"], "succeeded")
+        self.assertEqual(operation.json()["status"], "event_published")
         self.assertEqual(operation.json()["response"], completed_but_unseen.json())
         self.assertEqual(recovered.json(), completed_but_unseen.json())
         self.assertEqual(state_store.snapshot.version, 1)
@@ -1104,7 +1113,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(asset_client.credits, [])
         self.assertEqual(len(event_publisher.events), 1)
         operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
-        self.assertEqual(operation.status, "succeeded")
+        self.assertEqual(operation.status, "event_published")
 
     def test_expired_processing_pull_resumes_without_a_second_charge(self) -> None:
         state_store = FakePityStateStore(commit_unavailable=True)
@@ -1171,7 +1180,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(asset_client.credits, [])
         self.assertEqual(len(event_publisher.events), 1)
         operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
-        self.assertEqual(operation.status, "succeeded")
+        self.assertEqual(operation.status, "event_published")
         self.assertIsNotNone(operation.response)
         self.assertIsNotNone(operation.response.accepted_at)
         self.assertIsNone(operation.recovery_context)
@@ -1278,11 +1287,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(asset_client.spends), 1)
         self.assertEqual(len(event_publisher.events), 1)
 
-    def test_pending_event_recovery_publishes_and_marks_operation_succeeded(self) -> None:
+    def test_pending_event_recovery_replays_until_backpack_confirms_receipt(self) -> None:
         event_publisher = FakeEventPublisher(publish_error=True)
         client, state_store, event_publisher, asset_client = make_client(
             event_publisher=event_publisher,
         )
+        receipt_client = FakeBackpackReceiptClient()
 
         response = client.post(
             "/v1/me/pulls",
@@ -1295,18 +1305,37 @@ class ApiTests(unittest.TestCase):
         )
         event_publisher.publish_error = False
 
-        recovered_count = asyncio.run(
+        services = AppServices(state_store, event_publisher, object(), asset_client)
+        services.backpack_receipt_client = receipt_client
+        published_count = asyncio.run(
             recover_pending_pull_events_once(
-                AppServices(state_store, event_publisher, object(), asset_client),
+                services,
+                limit=10,
+                lock_ttl_seconds=30,
+            )
+        )
+        replayed_count = asyncio.run(
+            recover_pending_pull_events_once(
+                services,
+                limit=10,
+                lock_ttl_seconds=30,
+            )
+        )
+        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        assert operation.event is not None
+        receipt_client.applied_event_ids.add(operation.event.event_id)
+        confirmed_count = asyncio.run(
+            recover_pending_pull_events_once(
+                services,
                 limit=10,
                 lock_ttl_seconds=30,
             )
         )
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(recovered_count, 1)
-        self.assertEqual(len(event_publisher.events), 1)
-        operation = state_store.operations[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        self.assertEqual((published_count, replayed_count, confirmed_count), (1, 1, 1))
+        self.assertEqual(len(event_publisher.events), 2)
+        self.assertEqual(len(receipt_client.queries), 2)
         self.assertEqual(operation.status, "succeeded")
         self.assertIsNotNone(operation.response)
         self.assertIsNotNone(operation.event)
