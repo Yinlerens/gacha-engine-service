@@ -56,6 +56,7 @@ ASTRITE_PER_PULL = 160
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 REQUEST_ID_HEADER = "X-Request-Id"
 REQUEST_ACCEPTED_AT_HEADER = "X-Request-Accepted-At"
+PROBE_PATHS = frozenset({"/health", "/ready"})
 MAX_IDEMPOTENCY_KEY_LENGTH = 128
 MAX_ACCEPTED_AT_FUTURE_SKEW_SECONDS = 5
 PULL_PROCESSING_LEASE_SECONDS = 30
@@ -195,34 +196,37 @@ def register_access_log(app: FastAPI) -> None:
     @app.middleware("http")
     async def access_log_middleware(request: Request, call_next):
         started = time.monotonic()
+        is_probe_request = request.url.path in PROBE_PATHS
         request_id = request_id_from_header(request.headers.get(REQUEST_ID_HEADER))
         request.state.request_id = request_id
 
         try:
             response = await call_next(request)
         except Exception:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            LOGGER.exception(
-                "http request failed request_id=%s method=%s path=%s duration_ms=%s client_ip=%s",
-                request_id,
-                request.method,
-                request.url.path,
-                duration_ms,
-                request.client.host if request.client else "",
-            )
+            if not is_probe_request:
+                duration_ms = int((time.monotonic() - started) * 1000)
+                LOGGER.exception(
+                    "http request failed request_id=%s method=%s path=%s duration_ms=%s client_ip=%s",
+                    request_id,
+                    request.method,
+                    request.url.path,
+                    duration_ms,
+                    request.client.host if request.client else "",
+                )
             raise
 
         response.headers[REQUEST_ID_HEADER] = request_id
-        duration_ms = int((time.monotonic() - started) * 1000)
-        LOGGER.info(
-            "http request request_id=%s method=%s path=%s status=%s duration_ms=%s client_ip=%s",
-            request_id,
-            request.method,
-            request.url.path,
-            response.status_code,
-            duration_ms,
-            request.client.host if request.client else "",
-        )
+        if not is_probe_request:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            LOGGER.info(
+                "http request request_id=%s method=%s path=%s status=%s duration_ms=%s client_ip=%s",
+                request_id,
+                request.method,
+                request.url.path,
+                response.status_code,
+                duration_ms,
+                request.client.host if request.client else "",
+            )
         return response
 
 

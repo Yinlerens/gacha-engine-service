@@ -22,7 +22,12 @@ def run(host: str | None = None, port: int | None = None) -> None:
     bind_port = port or settings.port
 
     print(f"服务启动中：http://{bind_host}:{bind_port}/docs")
-    uvicorn.run("gacha_engine_service.main:app", host=bind_host, port=bind_port)
+    uvicorn.run(
+        "gacha_engine_service.main:app",
+        host=bind_host,
+        port=bind_port,
+        access_log=False,
+    )
 
 
 def main() -> None:
