@@ -89,6 +89,16 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("GACHA_ENGINE_BUILD_SHA=${{ github.sha }}", workflow)
         self.assertIn("chore: update image digest [skip ci]", workflow)
 
+    def test_service_owns_access_logging_without_uvicorn_duplicates(self) -> None:
+        root = Path(__file__).parents[1]
+        dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+        server = (root / "gacha_engine_service" / "server.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('"--no-access-log"', dockerfile)
+        self.assertIn("access_log=False", server)
+
 
 if __name__ == "__main__":
     unittest.main()
