@@ -222,6 +222,9 @@ class PullOperationRecord:
     operation_key: str
     user_id: UUID
     operation: PullOperation
+    request_id: UUID | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)

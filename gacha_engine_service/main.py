@@ -12,7 +12,7 @@ import time
 import uuid
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from .asset_client import AssetClient, AssetServiceError
@@ -30,7 +30,7 @@ from .engine import perform_pulls
 from .kafka_events import EventPublishError, KafkaEventPublisher
 from .postgres_state import PostgresGachaStateStore
 from .pull_audit import build_pull_audit_metadata, verify_pull_response
-from .pull_operations import PullOperation, PullRecoveryContext
+from .pull_operations import PullOperation, PullOperationRecord, PullRecoveryContext
 from .schemas import (
     ApiError,
     ErrorResponse,
@@ -39,7 +39,9 @@ from .schemas import (
     PullAuditMetadata,
     PullAuditVerificationResponse,
     PullCompletedEvent,
+    PullOperationListResponse,
     PullOperationStateResponse,
+    PullOperationSummary,
     PullRequest,
     PullResponse,
     ReadyResponse,
@@ -371,6 +373,34 @@ def register_routes(app: FastAPI) -> None:
             ),
             error=operation_error,
         )
+
+    @app.get(
+        "/v1/me/pulls/operations",
+        response_model=PullOperationListResponse,
+        tags=["gacha"],
+    )
+    async def list_pull_operations(
+        request: Request,
+        user_id: UUID = Depends(current_user_id),
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> PullOperationListResponse:
+        services: AppServices = request.app.state.services
+        try:
+            records = await services.state_store.list_pull_operations(
+                user_id=user_id,
+                limit=limit,
+            )
+            items = [pull_operation_summary(record) for record in records]
+        except GachaStateStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "state_store_unavailable",
+                    "message": "pull operation history is unavailable",
+                },
+            ) from exc
+
+        return PullOperationListResponse(items=items)
 
     @app.get(
         "/v1/me/pulls/{event_id}/audit",
@@ -866,6 +896,92 @@ async def publish_and_complete_claimed_pull(
     except GachaStateStoreError:
         LOGGER.warning("failed to save pull operation status", exc_info=True)
     return response
+
+
+def pull_operation_summary(record: PullOperationRecord) -> PullOperationSummary:
+    if record.created_at is None or record.updated_at is None:
+        raise GachaStateStoreError("pull operation timestamps are missing")
+
+    operation = record.operation
+    response = operation.response
+    event = operation.event
+    context = operation.recovery_context
+    response_records = response.records if response is not None else []
+    event_records = event.records if event is not None else []
+
+    operation_error = None
+    if operation.error_code or operation.error_message:
+        operation_error = ApiError(
+            code=operation.error_code or "pull_failed",
+            message=operation.error_message or "pull operation failed",
+        )
+
+    return PullOperationSummary(
+        operation_id=record.operation_key,
+        event_id=(
+            response.event_id
+            if response is not None
+            else event.event_id
+            if event is not None
+            else str(context.event_id)
+            if context is not None
+            else None
+        ),
+        request_id=(
+            str(record.request_id)
+            if record.request_id is not None
+            else context.request_id or None
+            if context is not None
+            else None
+        ),
+        banner_id=(
+            response_records[0].banner_id
+            if response_records
+            else event.banner_id
+            if event is not None
+            else context.banner.id
+            if context is not None
+            else None
+        ),
+        banner_version_id=(
+            response.banner_version_id
+            if response is not None
+            else event.banner_version_id
+            if event is not None
+            else context.banner_version_id
+            if context is not None
+            else None
+        ),
+        pity_group_id=(
+            response.pity_group_id
+            if response is not None
+            else event.pity_group_id
+            if event is not None
+            else context.pity_group_id
+            if context is not None
+            else None
+        ),
+        count=(
+            len(response_records)
+            if response is not None
+            else len(event_records)
+            if event is not None
+            else context.count
+            if context is not None
+            else None
+        ),
+        status=operation.status,
+        error=operation_error,
+        next_pity=(
+            response.next_pity
+            if response is not None
+            else event.next_pity
+            if event is not None
+            else None
+        ),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
 
 
 async def refund_claimed_spend(

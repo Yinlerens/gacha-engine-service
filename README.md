@@ -90,11 +90,15 @@ psql "$GACHA_STATE_DATABASE_URL" -f migrations/000005_backfill_pity_groups.up.sq
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000006_pity_groups_enforce.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000007_pull_audit_integrity.up.sql
 psql "$GACHA_STATE_DATABASE_URL" -f migrations/000008_reward_delivery_confirmation.up.sql
+psql "$GACHA_STATE_DATABASE_URL" -f migrations/000009_player_support_lookup.up.sql
+psql "$GACHA_STATE_DATABASE_URL" -f migrations/000010_backfill_player_support_request_ids.up.sql
 ```
 
 `000007` 必须先于包含审计功能的 Engine 版本部署。它为 `event_id` 建立在线索引，并保护已经生成的抽卡结果、Kafka 事件和成功记录不被修改或删除。
 
 `000008` 必须先于奖励回执确认版本部署。它新增 `event_published` 状态：Kafka 接受事件后操作仍不是终态，只有 Backpack 在同一数据库事务中保存库存、抽卡批次和出货记录后，Engine 才会把操作标记为 `succeeded`。
+
+`000009` 必须先于玩家客服版本部署。它增加持久请求号和按玩家时间倒序查询的在线索引；`000010` 随后只回填仍保留恢复上下文的历史请求号，不修改抽卡结果。
 
 生产环境不能清理 `gacha_runtime.pull_operations` 中的幂等键；如需归档响应正文，也必须永久保留 `(user_id, idempotency_key_hash)` 墓碑。
 

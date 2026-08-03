@@ -132,6 +132,7 @@ class PostgresGachaStateStore:
                     processing_token,
                     lease_seconds,
                     _model_json(recovery_context),
+                    recovery_context.request_id or None,
                 )
                 if created is not None:
                     return PullOperationClaim(
@@ -183,6 +184,26 @@ class PostgresGachaStateStore:
                 return existing[1] if existing is not None else None
         except Exception as exc:
             raise GachaStateStoreError("read pull operation from postgres failed") from exc
+
+    async def list_pull_operations(
+        self,
+        *,
+        user_id: UUID,
+        limit: int,
+    ) -> list[PullOperationRecord]:
+        pool = await self._ensure_pool()
+        normalized_limit = max(1, min(100, limit))
+        try:
+            async with pool.acquire() as connection:
+                rows = await connection.fetch(
+                    SELECT_PULL_OPERATIONS_BY_USER_SQL,
+                    user_id,
+                    normalized_limit,
+                )
+        except Exception as exc:
+            raise GachaStateStoreError("list pull operations from postgres failed") from exc
+
+        return [_operation_record_from_row(row) for row in rows]
 
     async def get_pull_operation_by_key(self, *, operation_key: str) -> PullOperation | None:
         operation_id = _operation_id(operation_key)
@@ -577,6 +598,18 @@ def _operation_from_row(row: Any) -> PullOperation:
     )
 
 
+def _operation_record_from_row(row: Any) -> PullOperationRecord:
+    request_id = row["request_id"]
+    return PullOperationRecord(
+        operation_key=str(row["id"]),
+        user_id=UUID(str(row["user_id"])),
+        operation=_operation_from_row(row),
+        request_id=UUID(str(request_id)) if request_id is not None else None,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, str):
         return json.loads(value)
@@ -633,11 +666,11 @@ where user_id = $1 and pity_group_id = $2
 INSERT_PULL_OPERATION_SQL = """
 insert into gacha_runtime.pull_operations (
   id, user_id, idempotency_key_hash, request_hash, status,
-  processing_token, processing_lease_until, recovery_context
+  processing_token, processing_lease_until, recovery_context, request_id
 )
 values (
   $1, $2, $3, $4, 'processing', $5,
-  now() + make_interval(secs => $6), $7::jsonb
+  now() + make_interval(secs => $6), $7::jsonb, $8
 )
 on conflict (user_id, idempotency_key_hash) do nothing
 returning id, user_id, status, request_hash, response, event, error_code,
@@ -664,6 +697,16 @@ select id, user_id, status, request_hash, response, event, error_code,
        error_message, processing_token, recovery_context
 from gacha_runtime.pull_operations
 where user_id = $1 and idempotency_key_hash = $2
+"""
+
+SELECT_PULL_OPERATIONS_BY_USER_SQL = """
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context, request_id,
+       created_at, updated_at
+from gacha_runtime.pull_operations
+where user_id = $1
+order by created_at desc, id desc
+limit $2
 """
 
 SELECT_PULL_OPERATION_BY_ID_SQL = """

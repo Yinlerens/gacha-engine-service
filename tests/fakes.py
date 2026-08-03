@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import datetime, timezone
 import uuid
 from uuid import UUID
 
@@ -60,6 +61,7 @@ class FakePityStateStore:
         self.operations: dict[tuple[UUID, str], PullOperation] = {}
         self.operation_ids: dict[tuple[UUID, str], str] = {}
         self.operation_keys: dict[str, tuple[UUID, str]] = {}
+        self.operation_metadata: dict[str, tuple[UUID | None, datetime, datetime]] = {}
         self.processing_tokens: dict[tuple[UUID, str], UUID] = {}
         self.claimable_operations: set[tuple[UUID, str]] = set()
         self.recovery_locks: set[str] = set()
@@ -145,6 +147,12 @@ class FakePityStateStore:
         self.operations[key] = operation
         self.operation_ids[key] = operation_key
         self.operation_keys[operation_key] = key
+        now = datetime.now(timezone.utc)
+        try:
+            operation_request_id = UUID(recovery_context.request_id)
+        except ValueError:
+            operation_request_id = None
+        self.operation_metadata[operation_key] = (operation_request_id, now, now)
         self.processing_tokens[key] = token
         return PullOperationClaim(
             operation_key=operation_key,
@@ -164,6 +172,38 @@ class FakePityStateStore:
         if self.unavailable:
             raise GachaStateStoreError("state database is unavailable")
         return self.operations.get((user_id, idempotency_key))
+
+    async def list_pull_operations(
+        self,
+        *,
+        user_id: UUID,
+        limit: int,
+    ) -> list[PullOperationRecord]:
+        if self.unavailable:
+            raise GachaStateStoreError("state database is unavailable")
+
+        records: list[PullOperationRecord] = []
+        for key, operation in self.operations.items():
+            if key[0] != user_id:
+                continue
+            operation_key = self.operation_ids[key]
+            request_id, created_at, updated_at = self.operation_metadata[operation_key]
+            records.append(
+                PullOperationRecord(
+                    operation_key=operation_key,
+                    user_id=user_id,
+                    operation=operation,
+                    request_id=request_id,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+
+        records.sort(
+            key=lambda record: (record.created_at, record.operation_key),
+            reverse=True,
+        )
+        return records[: max(1, min(100, limit))]
 
     async def get_pull_operation_by_key(self, *, operation_key: str) -> PullOperation | None:
         key = self.operation_keys.get(operation_key)

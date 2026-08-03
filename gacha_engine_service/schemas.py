@@ -153,6 +153,32 @@ class PullOperationStateResponse(BaseModel):
     error: ApiError | None = None
 
 
+class PullOperationSummary(BaseModel):
+    operation_id: str
+    event_id: str | None = None
+    request_id: str | None = None
+    banner_id: str | None = None
+    banner_version_id: str | None = None
+    pity_group_id: str | None = None
+    count: int | None = None
+    status: Literal[
+        "processing",
+        "event_pending",
+        "event_published",
+        "succeeded",
+        "refund_pending",
+        "failed",
+    ]
+    error: ApiError | None = None
+    next_pity: PitySnapshot | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PullOperationListResponse(BaseModel):
+    items: list[PullOperationSummary] = Field(default_factory=list)
+
+
 class PullCompletedEvent(BaseModel):
     event_id: str
     event_type: Literal["gacha.pull_completed.v1"] = "gacha.pull_completed.v1"

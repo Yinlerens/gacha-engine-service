@@ -192,6 +192,9 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(claim.processing_token)
         insert_call = connection.fetchrow_calls[0]
         self.assertIn("gacha_runtime.pull_operations", str(insert_call[0]))
+        self.assertIn("processing_lease_until", str(insert_call[0]))
+        self.assertIn("recovery_context", str(insert_call[0]))
+        self.assertNotIn("pull-key", insert_call)
 
     async def test_list_pull_operations_is_scoped_to_user_and_newest_first(self) -> None:
         connection = FakeConnection(fetch_results=[[operation_row()]])
@@ -209,9 +212,6 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("where user_id = $1", query)
         self.assertIn("order by created_at desc, id desc", query)
         self.assertEqual(connection.fetch_calls[0][1:], (USER_ID, 20))
-        self.assertIn("processing_lease_until", str(insert_call[0]))
-        self.assertIn("recovery_context", str(insert_call[0]))
-        self.assertNotIn("pull-key", insert_call)
 
     async def test_expired_processing_operation_is_claimed_with_fencing_token(self) -> None:
         context = recovery_context()
@@ -445,18 +445,22 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("status = 'refund_pending'", normalized)
         self.assertNotIn("recovery_context jsonb not null", normalized)
 
-    def test_player_support_lookup_migration_preserves_request_identity_and_order(self) -> None:
-        migration = (
-            Path(__file__).parents[1]
-            / "migrations"
-            / "000009_player_support_lookup.up.sql"
-        ).read_text(encoding="utf-8")
+    def test_player_support_migrations_separate_schema_and_request_id_backfill(self) -> None:
+        migrations = Path(__file__).parents[1] / "migrations"
+        schema = (migrations / "000009_player_support_lookup.up.sql").read_text(
+            encoding="utf-8"
+        ).lower()
+        backfill = (
+            migrations / "000010_backfill_player_support_request_ids.up.sql"
+        ).read_text(encoding="utf-8").lower()
 
-        normalized = migration.lower()
-        self.assertIn("add column if not exists request_id uuid", normalized)
-        self.assertIn("recovery_context ->> 'request_id'", normalized)
-        self.assertIn("(user_id, created_at desc, id desc)", normalized)
-        self.assertIn("create index concurrently", normalized)
+        self.assertIn("add column if not exists request_id uuid", schema)
+        self.assertIn("(user_id, created_at desc, id desc)", schema)
+        self.assertIn("create index concurrently", schema)
+        self.assertNotIn("update gacha_runtime.pull_operations", schema)
+        self.assertIn("update gacha_runtime.pull_operations", backfill)
+        self.assertIn("recovery_context ->> 'request_id'", backfill)
+        self.assertNotIn("alter table", backfill)
 
     def test_pity_group_migrations_preserve_legacy_rows_before_enforcing_uniqueness(self) -> None:
         migrations = Path(__file__).parents[1] / "migrations"
