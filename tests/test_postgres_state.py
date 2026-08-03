@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -20,6 +21,9 @@ OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
 REQUEST_HASH = "a" * 64
 PROCESSING_TOKEN = UUID("22222222-2222-4222-8222-222222222222")
 EVENT_ID = "33333333-3333-4333-8333-333333333333"
+REQUEST_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+CREATED_AT = datetime(2026, 8, 3, 1, 2, 3, tzinfo=timezone.utc)
+UPDATED_AT = datetime(2026, 8, 3, 1, 2, 4, tzinfo=timezone.utc)
 
 
 class FakeTransaction:
@@ -114,6 +118,9 @@ def operation_row(
         "error_code": None,
         "error_message": None,
         "processing_token": processing_token,
+        "request_id": REQUEST_ID,
+        "created_at": CREATED_AT,
+        "updated_at": UPDATED_AT,
         "recovery_context": (
             recovery_context.model_dump(mode="json")
             if recovery_context is not None
@@ -185,6 +192,23 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(claim.processing_token)
         insert_call = connection.fetchrow_calls[0]
         self.assertIn("gacha_runtime.pull_operations", str(insert_call[0]))
+
+    async def test_list_pull_operations_is_scoped_to_user_and_newest_first(self) -> None:
+        connection = FakeConnection(fetch_results=[[operation_row()]])
+        store = make_store(connection)
+
+        records = await store.list_pull_operations(user_id=USER_ID, limit=20)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].operation_key, str(OPERATION_ID))
+        self.assertEqual(records[0].user_id, USER_ID)
+        self.assertEqual(records[0].request_id, REQUEST_ID)
+        self.assertEqual(records[0].created_at, CREATED_AT)
+        self.assertEqual(records[0].updated_at, UPDATED_AT)
+        query = str(connection.fetch_calls[0][0]).lower()
+        self.assertIn("where user_id = $1", query)
+        self.assertIn("order by created_at desc, id desc", query)
+        self.assertEqual(connection.fetch_calls[0][1:], (USER_ID, 20))
         self.assertIn("processing_lease_until", str(insert_call[0]))
         self.assertIn("recovery_context", str(insert_call[0]))
         self.assertNotIn("pull-key", insert_call)
@@ -420,6 +444,19 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("create index concurrently", normalized)
         self.assertIn("status = 'refund_pending'", normalized)
         self.assertNotIn("recovery_context jsonb not null", normalized)
+
+    def test_player_support_lookup_migration_preserves_request_identity_and_order(self) -> None:
+        migration = (
+            Path(__file__).parents[1]
+            / "migrations"
+            / "000009_player_support_lookup.up.sql"
+        ).read_text(encoding="utf-8")
+
+        normalized = migration.lower()
+        self.assertIn("add column if not exists request_id uuid", normalized)
+        self.assertIn("recovery_context ->> 'request_id'", normalized)
+        self.assertIn("(user_id, created_at desc, id desc)", normalized)
+        self.assertIn("create index concurrently", normalized)
 
     def test_pity_group_migrations_preserve_legacy_rows_before_enforcing_uniqueness(self) -> None:
         migrations = Path(__file__).parents[1] / "migrations"

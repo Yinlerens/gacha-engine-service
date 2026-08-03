@@ -602,6 +602,120 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "state_store_unavailable")
 
+    def test_list_pull_operations_requires_gateway_authentication(self) -> None:
+        client, _, _, _ = make_client()
+
+        response = client.get(
+            "/v1/me/pulls/operations",
+            headers={"X-User-Id": USER_ID},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_list_pull_operations_returns_limited_safe_current_user_summaries(self) -> None:
+        client, state_store, _, _ = make_client()
+        first_headers = {
+            **HEADERS,
+            "Idempotency-Key": "support-first",
+            "X-Request-Id": "11111111-1111-4111-8111-111111111111",
+        }
+        second_headers = {
+            **HEADERS,
+            "Idempotency-Key": "support-second",
+            "X-Request-Id": "22222222-2222-4222-8222-222222222222",
+        }
+        first = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1},
+            headers=first_headers,
+        )
+        second = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 10},
+            headers=second_headers,
+        )
+
+        response = client.get(
+            "/v1/me/pulls/operations?limit=1",
+            headers={
+                "X-Internal-Token": "test-token",
+                "X-User-Id": USER_ID,
+            },
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(set(payload), {"items"})
+        self.assertEqual(len(payload["items"]), 1)
+        item = payload["items"][0]
+        self.assertEqual(
+            set(item),
+            {
+                "operation_id",
+                "event_id",
+                "request_id",
+                "banner_id",
+                "banner_version_id",
+                "pity_group_id",
+                "count",
+                "status",
+                "error",
+                "next_pity",
+                "created_at",
+                "updated_at",
+            },
+        )
+        self.assertEqual(item["operation_id"], state_store.operation_ids[(UUID(USER_ID), "support-second")])
+        self.assertEqual(item["event_id"], second.json()["event_id"])
+        self.assertEqual(item["request_id"], second_headers["X-Request-Id"])
+        self.assertEqual(item["banner_id"], "limited-character-001")
+        self.assertEqual(item["count"], 10)
+        self.assertEqual(item["status"], "event_published")
+        self.assertEqual(item["next_pity"], second.json()["next_pity"])
+        self.assertIsNone(item["error"])
+        self.assertNotIn("request_hash", response.text)
+        self.assertNotIn("recovery_context", response.text)
+        self.assertNotIn("seed", response.text)
+        self.assertNotIn(USER_ID, response.text)
+
+    def test_list_pull_operations_cannot_cross_user_boundaries(self) -> None:
+        client, _, _, _ = make_client()
+        created = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1},
+            headers=HEADERS,
+        )
+        other_user_id = "b6cc17d1-4e6e-4691-9ed7-d5893ab2dd2d"
+
+        response = client.get(
+            f"/v1/me/pulls/operations?user_id={USER_ID}",
+            headers={
+                "X-Internal-Token": "test-token",
+                "X-User-Id": other_user_id,
+            },
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"items": []})
+
+    def test_list_pull_operations_reports_state_database_failure(self) -> None:
+        client, _, _, _ = make_client(state_store=FakePityStateStore(unavailable=True))
+
+        response = client.get(
+            "/v1/me/pulls/operations",
+            headers={
+                "X-Internal-Token": "test-token",
+                "X-User-Id": USER_ID,
+            },
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "state_store_unavailable")
+
     def test_pull_rejects_unknown_banner(self) -> None:
         client, _, _, _ = make_client()
 
