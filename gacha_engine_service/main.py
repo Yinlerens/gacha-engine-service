@@ -40,6 +40,8 @@ from .schemas import (
     PullAuditVerificationResponse,
     PullCompletedEvent,
     PullOperationListResponse,
+    PullOperationReplayRequest,
+    PullOperationReplayResponse,
     PullOperationStateResponse,
     PullOperationSummary,
     PullRequest,
@@ -401,6 +403,51 @@ def register_routes(app: FastAPI) -> None:
             ) from exc
 
         return PullOperationListResponse(items=items)
+
+    @app.get(
+        "/v1/me/pulls/operations/{operation_id}/replay",
+        response_model=PullOperationReplayResponse,
+        tags=["gacha"],
+    )
+    async def replay_pull_operation(
+        operation_id: UUID,
+        request: Request,
+        user_id: UUID = Depends(current_user_id),
+    ) -> PullOperationReplayResponse:
+        services: AppServices = request.app.state.services
+        try:
+            record = await services.state_store.get_pull_operation_record(
+                user_id=user_id,
+                operation_id=operation_id,
+            )
+        except GachaStateStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "state_store_unavailable",
+                    "message": "pull operation replay is unavailable",
+                },
+            ) from exc
+
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "pull_operation_not_found",
+                    "message": "pull operation was not found",
+                },
+            )
+
+        try:
+            return pull_operation_replay(record)
+        except GachaStateStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "state_store_unavailable",
+                    "message": "pull operation replay is unavailable",
+                },
+            ) from exc
 
     @app.get(
         "/v1/me/pulls/{event_id}/audit",
@@ -979,6 +1026,99 @@ def pull_operation_summary(record: PullOperationRecord) -> PullOperationSummary:
             if event is not None
             else None
         ),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def pull_operation_replay(record: PullOperationRecord) -> PullOperationReplayResponse:
+    if record.created_at is None or record.updated_at is None:
+        raise GachaStateStoreError("pull operation timestamps are missing")
+
+    operation = record.operation
+    response = operation.response
+    event = operation.event
+    context = operation.recovery_context
+    response_records = response.records if response is not None else []
+    event_records = event.records if event is not None else []
+
+    if context is not None:
+        replay_request = PullOperationReplayRequest(
+            source="recovery_context",
+            banner_id=context.banner.id,
+            banner_version_id=context.banner_version_id,
+            pity_group_id=context.pity_group_id,
+            count=context.count,
+            seed=context.seed,
+            event_id=str(context.event_id),
+            amount_minor=context.amount_minor,
+            accepted_at=context.accepted_at,
+        )
+    else:
+        count = len(response_records) if response is not None else len(event_records) if event is not None else None
+        replay_request = PullOperationReplayRequest(
+            source="persisted_result" if response is not None or event is not None else "operation_only",
+            banner_id=(
+                response_records[0].banner_id
+                if response_records
+                else event.banner_id
+                if event is not None
+                else None
+            ),
+            banner_version_id=(
+                response.banner_version_id
+                if response is not None
+                else event.banner_version_id
+                if event is not None
+                else None
+            ),
+            pity_group_id=(
+                response.pity_group_id
+                if response is not None
+                else event.pity_group_id
+                if event is not None
+                else None
+            ),
+            count=count,
+            seed=response.seed if response is not None else event.seed if event is not None else None,
+            event_id=(
+                response.event_id
+                if response is not None
+                else event.event_id
+                if event is not None
+                else None
+            ),
+            amount_minor=count * ASTRITE_PER_PULL if count is not None else None,
+            accepted_at=(
+                response.accepted_at
+                if response is not None
+                else event.accepted_at
+                if event is not None
+                else record.created_at
+            ),
+        )
+
+    operation_error = None
+    if operation.error_code or operation.error_message:
+        operation_error = ApiError(
+            code=operation.error_code or "pull_failed",
+            message=operation.error_message or "pull operation failed",
+        )
+
+    return PullOperationReplayResponse(
+        operation_id=record.operation_key,
+        request_id=(
+            str(record.request_id)
+            if record.request_id is not None
+            else context.request_id or None
+            if context is not None
+            else None
+        ),
+        status=operation.status,
+        request=replay_request,
+        response=response,
+        event=event,
+        error=operation_error,
         created_at=record.created_at,
         updated_at=record.updated_at,
     )

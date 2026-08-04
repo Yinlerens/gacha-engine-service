@@ -213,6 +213,23 @@ class PostgresStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("order by created_at desc, id desc", query)
         self.assertEqual(connection.fetch_calls[0][1:], (USER_ID, 20))
 
+    async def test_get_pull_operation_record_is_scoped_to_user_and_operation(self) -> None:
+        connection = FakeConnection(fetchrow_results=[operation_row()])
+        store = make_store(connection)
+
+        record = await store.get_pull_operation_record(
+            user_id=USER_ID,
+            operation_id=OPERATION_ID,
+        )
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.operation_key, str(OPERATION_ID))
+        self.assertEqual(record.user_id, USER_ID)
+        query = str(connection.fetchrow_calls[0][0]).lower()
+        self.assertIn("where user_id = $1 and id = $2", query)
+        self.assertEqual(connection.fetchrow_calls[0][1:], (USER_ID, OPERATION_ID))
+
     async def test_expired_processing_operation_is_claimed_with_fencing_token(self) -> None:
         context = recovery_context()
         connection = FakeConnection(

@@ -716,6 +716,116 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "state_store_unavailable")
 
+    def test_pull_operation_replay_uses_durable_operation_evidence(self) -> None:
+        client, state_store, _, _ = make_client()
+        created = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 10},
+            headers=HEADERS,
+        )
+        operation_id = state_store.operation_ids[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+
+        response = client.get(
+            f"/v1/me/pulls/operations/{operation_id}/replay",
+            headers={"X-Internal-Token": "test-token", "X-User-Id": USER_ID},
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["operation_id"], operation_id)
+        self.assertEqual(payload["request_id"], REQUEST_ID)
+        self.assertEqual(payload["request"]["source"], "persisted_result")
+        self.assertEqual(payload["request"]["banner_id"], "limited-character-001")
+        self.assertEqual(payload["request"]["count"], 10)
+        self.assertEqual(payload["request"]["amount_minor"], 1600)
+        self.assertEqual(payload["request"]["event_id"], created.json()["event_id"])
+        self.assertEqual(payload["response"]["event_id"], created.json()["event_id"])
+        self.assertNotIn("recovery_context", response.text)
+        self.assertNotIn("request_hash", response.text)
+
+    def test_legacy_completed_pull_replays_without_request_id_or_recovery_context(self) -> None:
+        client, state_store, _, _ = make_client()
+        created = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1},
+            headers=HEADERS,
+        )
+        key = (UUID(USER_ID), HEADERS["Idempotency-Key"])
+        operation_id = state_store.operation_ids[key]
+        state_store.operations[key] = state_store.operations[key].model_copy(
+            update={"recovery_context": None}
+        )
+        _, created_at, updated_at = state_store.operation_metadata[operation_id]
+        state_store.operation_metadata[operation_id] = (None, created_at, updated_at)
+
+        response = client.get(
+            f"/v1/me/pulls/operations/{operation_id}/replay",
+            headers={"X-Internal-Token": "test-token", "X-User-Id": USER_ID},
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertIsNone(payload["request_id"])
+        self.assertEqual(payload["request"]["source"], "persisted_result")
+        self.assertEqual(payload["request"]["banner_id"], "limited-character-001")
+        self.assertEqual(payload["request"]["count"], 1)
+        self.assertEqual(payload["request"]["seed"], created.json()["seed"])
+        self.assertEqual(payload["request"]["event_id"], created.json()["event_id"])
+
+    def test_pull_operation_replay_cannot_cross_user_boundaries(self) -> None:
+        client, state_store, _, _ = make_client()
+        created = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1},
+            headers=HEADERS,
+        )
+        operation_id = state_store.operation_ids[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+
+        response = client.get(
+            f"/v1/me/pulls/operations/{operation_id}/replay",
+            headers={
+                "X-Internal-Token": "test-token",
+                "X-User-Id": "b6cc17d1-4e6e-4691-9ed7-d5893ab2dd2d",
+            },
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["code"], "pull_operation_not_found")
+
+    def test_pull_operation_replay_reports_unavailable_durable_state(self) -> None:
+        client, _, _, _ = make_client(state_store=FakePityStateStore(unavailable=True))
+
+        response = client.get(
+            "/v1/me/pulls/operations/77777777-7777-4777-8777-777777777777/replay",
+            headers={"X-Internal-Token": "test-token", "X-User-Id": USER_ID},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "state_store_unavailable")
+
+    def test_pull_operation_replay_reports_incomplete_durable_record(self) -> None:
+        client, state_store, _, _ = make_client()
+        created = client.post(
+            "/v1/me/pulls",
+            json={"banner_id": "limited-character-001", "count": 1},
+            headers=HEADERS,
+        )
+        operation_id = state_store.operation_ids[(UUID(USER_ID), HEADERS["Idempotency-Key"])]
+        request_id, _, updated_at = state_store.operation_metadata[operation_id]
+        state_store.operation_metadata[operation_id] = (request_id, None, updated_at)
+
+        response = client.get(
+            f"/v1/me/pulls/operations/{operation_id}/replay",
+            headers={"X-Internal-Token": "test-token", "X-User-Id": USER_ID},
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "state_store_unavailable")
+
     def test_pull_rejects_unknown_banner(self) -> None:
         client, _, _, _ = make_client()
 

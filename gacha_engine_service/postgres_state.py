@@ -205,6 +205,25 @@ class PostgresGachaStateStore:
 
         return [_operation_record_from_row(row) for row in rows]
 
+    async def get_pull_operation_record(
+        self,
+        *,
+        user_id: UUID,
+        operation_id: UUID,
+    ) -> PullOperationRecord | None:
+        pool = await self._ensure_pool()
+        try:
+            async with pool.acquire() as connection:
+                row = await connection.fetchrow(
+                    SELECT_PULL_OPERATION_RECORD_SQL,
+                    user_id,
+                    operation_id,
+                )
+        except Exception as exc:
+            raise GachaStateStoreError("read pull operation replay from postgres failed") from exc
+
+        return _operation_record_from_row(row) if row is not None else None
+
     async def get_pull_operation_by_key(self, *, operation_key: str) -> PullOperation | None:
         operation_id = _operation_id(operation_key)
         pool = await self._ensure_pool()
@@ -707,6 +726,14 @@ from gacha_runtime.pull_operations
 where user_id = $1
 order by created_at desc, id desc
 limit $2
+"""
+
+SELECT_PULL_OPERATION_RECORD_SQL = """
+select id, user_id, status, request_hash, response, event, error_code,
+       error_message, processing_token, recovery_context, request_id,
+       created_at, updated_at
+from gacha_runtime.pull_operations
+where user_id = $1 and id = $2
 """
 
 SELECT_PULL_OPERATION_BY_ID_SQL = """

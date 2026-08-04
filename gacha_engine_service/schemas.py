@@ -179,6 +179,37 @@ class PullOperationListResponse(BaseModel):
     items: list[PullOperationSummary] = Field(default_factory=list)
 
 
+class PullOperationReplayRequest(BaseModel):
+    source: Literal["recovery_context", "persisted_result", "operation_only"]
+    banner_id: str | None = None
+    banner_version_id: str | None = None
+    pity_group_id: str | None = None
+    count: int | None = Field(default=None, ge=1)
+    seed: str | None = None
+    event_id: str | None = None
+    amount_minor: int | None = Field(default=None, ge=1)
+    accepted_at: datetime | None = None
+
+
+class PullOperationReplayResponse(BaseModel):
+    operation_id: str
+    request_id: str | None = None
+    status: Literal[
+        "processing",
+        "event_pending",
+        "event_published",
+        "succeeded",
+        "refund_pending",
+        "failed",
+    ]
+    request: PullOperationReplayRequest
+    response: PullResponse | None = None
+    event: PullCompletedEvent | None = None
+    error: ApiError | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class PullCompletedEvent(BaseModel):
     event_id: str
     event_type: Literal["gacha.pull_completed.v1"] = "gacha.pull_completed.v1"

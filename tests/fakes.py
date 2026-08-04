@@ -205,6 +205,28 @@ class FakePityStateStore:
         )
         return records[: max(1, min(100, limit))]
 
+    async def get_pull_operation_record(
+        self,
+        *,
+        user_id: UUID,
+        operation_id: UUID,
+    ) -> PullOperationRecord | None:
+        if self.unavailable:
+            raise GachaStateStoreError("state database is unavailable")
+        operation_key = str(operation_id)
+        key = self.operation_keys.get(operation_key)
+        if key is None or key[0] != user_id:
+            return None
+        request_id, created_at, updated_at = self.operation_metadata[operation_key]
+        return PullOperationRecord(
+            operation_key=operation_key,
+            user_id=user_id,
+            operation=self.operations[key],
+            request_id=request_id,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
     async def get_pull_operation_by_key(self, *, operation_key: str) -> PullOperation | None:
         key = self.operation_keys.get(operation_key)
         return self.operations.get(key) if key is not None else None
