@@ -7,13 +7,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-import logging
 import time
 import uuid
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
+from opentelemetry.instrumentation.utils import suppress_instrumentation
 
 from .asset_client import AssetClient, AssetServiceError
 from .backpack_client import BackpackReceiptClient, BackpackReceiptError
@@ -53,9 +54,11 @@ from .state_store import (
     PityVersionConflict,
     PullOperationOwnershipLost,
 )
+from .telemetry import application_logger, configure_telemetry, instrument_fastapi
 
 
-LOGGER = logging.getLogger(__name__)
+configure_telemetry("gacha-engine-service")
+LOGGER = application_logger(__name__)
 ASTRITE_PER_PULL = 160
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 REQUEST_ID_HEADER = "X-Request-Id"
@@ -193,6 +196,7 @@ def create_app(
     register_access_log(app)
     register_exception_handlers(app)
     register_routes(app)
+    instrument_fastapi(app)
     return app
 
 
@@ -203,19 +207,26 @@ def register_access_log(app: FastAPI) -> None:
         is_probe_request = request.url.path in PROBE_PATHS
         request_id = request_id_from_header(request.headers.get(REQUEST_ID_HEADER))
         request.state.request_id = request_id
+        trace.get_current_span().set_attribute("app.request_id", request_id)
 
         try:
-            response = await call_next(request)
+            if is_probe_request:
+                with suppress_instrumentation():
+                    response = await call_next(request)
+            else:
+                response = await call_next(request)
         except Exception:
             if not is_probe_request:
                 duration_ms = int((time.monotonic() - started) * 1000)
                 LOGGER.exception(
-                    "http request failed request_id=%s method=%s path=%s duration_ms=%s client_ip=%s",
-                    request_id,
-                    request.method,
-                    request.url.path,
-                    duration_ms,
-                    request.client.host if request.client else "",
+                    "http request failed",
+                    extra={
+                        "request_id": request_id,
+                        "method": request.method,
+                        "path": request.url.path,
+                        "duration_ms": duration_ms,
+                        "client_ip": request.client.host if request.client else "",
+                    },
                 )
             raise
 
@@ -223,13 +234,15 @@ def register_access_log(app: FastAPI) -> None:
         if not is_probe_request:
             duration_ms = int((time.monotonic() - started) * 1000)
             LOGGER.info(
-                "http request request_id=%s method=%s path=%s status=%s duration_ms=%s client_ip=%s",
-                request_id,
-                request.method,
-                request.url.path,
-                response.status_code,
-                duration_ms,
-                request.client.host if request.client else "",
+                "http request",
+                extra={
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": duration_ms,
+                    "client_ip": request.client.host if request.client else "",
+                },
             )
         return response
 
@@ -560,6 +573,7 @@ def register_routes(app: FastAPI) -> None:
 
         cost_minor = pull_request.count * ASTRITE_PER_PULL
         event_id = deterministic_pull_event_id(user_id, idempotency_key)
+        trace.get_current_span().set_attribute("gacha.event_id", event_id)
         settings: Settings = request.app.state.settings
         try:
             audit = build_pull_audit_metadata(
@@ -621,6 +635,10 @@ async def claim_or_resume_pull(
                 "message": "pull idempotency is unavailable",
             },
         ) from exc
+
+    trace.get_current_span().set_attribute(
+        "gacha.operation.id", operation_claim.operation_key
+    )
 
     claimed_context = operation_claim.operation.recovery_context or recovery_context
     if not operation_claim.acquired:

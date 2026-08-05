@@ -53,6 +53,20 @@ spec:
               value: gacha.pull_completed.v1
             - name: KAFKA_CLIENT_ID
               value: gacha-engine-service
+            - name: OTEL_SERVICE_NAME
+              value: gacha-engine-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.monitoring.svc.cluster.local:4317
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: grpc
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_TRACES_SAMPLER
+              value: parentbased_traceidratio
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: "1.0"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: deployment.environment.name=test,k8s.cluster.name=wuwa
             - name: GACHA_CONFIG_DATABASE_URL
               valueFrom:
                 secretKeyRef:

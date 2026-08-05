@@ -5,8 +5,13 @@ from __future__ import annotations
 import json
 
 from aiokafka import AIOKafkaProducer
+from opentelemetry import propagate, trace
+from opentelemetry.trace import SpanKind
 
 from .schemas import PullCompletedEvent
+
+
+TRACER = trace.get_tracer(__name__)
 
 
 class EventPublishError(Exception):
@@ -44,14 +49,29 @@ class KafkaEventPublisher:
             separators=(",", ":"),
         ).encode("utf-8")
 
-        try:
-            await producer.send_and_wait(
-                self._topic,
-                payload,
-                key=event.user_id.encode("utf-8"),
-            )
-        except Exception as exc:  # aiokafka exposes several transport exceptions.
-            raise EventPublishError("failed to publish pull event") from exc
+        with TRACER.start_as_current_span(
+            f"{self._topic} publish",
+            kind=SpanKind.PRODUCER,
+            attributes={
+                "messaging.system": "kafka",
+                "messaging.destination.name": self._topic,
+                "messaging.operation.name": "publish",
+                "messaging.message.id": event.event_id,
+            },
+        ):
+            carrier: dict[str, str] = {}
+            propagate.inject(carrier)
+            headers = [(key, value.encode("utf-8")) for key, value in carrier.items()]
+
+            try:
+                await producer.send_and_wait(
+                    self._topic,
+                    payload,
+                    key=event.user_id.encode("utf-8"),
+                    headers=headers,
+                )
+            except Exception as exc:  # aiokafka exposes several transport exceptions.
+                raise EventPublishError("failed to publish pull event") from exc
 
     async def _ensure_started(self) -> AIOKafkaProducer:
         if self._producer is not None:
@@ -71,4 +91,3 @@ class KafkaEventPublisher:
 
         self._producer = producer
         return producer
-
